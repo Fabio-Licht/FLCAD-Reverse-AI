@@ -17,6 +17,7 @@ class SceneObject:
     render_options: dict[str, Any]
     visible: bool = True
     selected: bool = False
+    selection_state: dict[str, Any] | None = None
 
 
 @dataclass
@@ -35,7 +36,17 @@ class SceneObjectSnapshot:
 class SceneManager:
     """Gerencia os objetos renderizados no Genesis."""
 
-    SELECTION_COLOR = "#f2b134"
+    SELECTION_COLORS = {
+        "mesh": "#d9efff",
+        "reference_plane": "#78ff9b",
+        "reference_cylinder": "#ff9f43",
+        "reference_axis": "#54d8ff",
+        "reference_point": "#ff5b5b",
+        "sketch": "#d6a7ff",
+        "curve": "#ff77c8",
+        "surface": "#7fffd4",
+        "solid": "#fff176",
+    }
 
     def __init__(
         self,
@@ -212,24 +223,237 @@ class SceneManager:
         self.viewer.render()
         return True
 
+
+    def _actor_property(
+        self,
+        scene_object: SceneObject,
+    ) -> Any:
+        """Obtém a propriedade VTK/PyVista do ator."""
+
+        actor = scene_object.actor
+
+        try:
+            return actor.GetProperty()
+        except Exception:
+            return getattr(actor, "prop", None)
+
+    def _capture_selection_state(
+        self,
+        scene_object: SceneObject,
+    ) -> dict[str, Any]:
+        """Guarda aparência para restauração fiel."""
+
+        prop = self._actor_property(scene_object)
+        state: dict[str, Any] = {}
+
+        if prop is None:
+            return state
+
+        getters = {
+            "color": ("GetColor",),
+            "edge_color": ("GetEdgeColor",),
+            "opacity": ("GetOpacity",),
+            "line_width": ("GetLineWidth",),
+            "edge_visibility": ("GetEdgeVisibility",),
+        }
+
+        for key, names in getters.items():
+            for name in names:
+                method = getattr(prop, name, None)
+
+                if callable(method):
+                    try:
+                        state[key] = method()
+                    except Exception:
+                        pass
+                    break
+
+        return state
+
+    def _apply_selection_appearance(
+        self,
+        scene_object: SceneObject,
+    ) -> None:
+        """Aplica destaque visual específico por tipo."""
+
+        prop = self._actor_property(scene_object)
+
+        if prop is None:
+            return
+
+        color = self.SELECTION_COLORS.get(
+            scene_object.object_type,
+            "#f2b134",
+        )
+
+        try:
+            from pyvista import Color
+
+            rgb = Color(color).float_rgb
+        except Exception:
+            rgb = (1.0, 0.70, 0.20)
+
+        try:
+            prop.SetColor(*rgb)
+        except Exception:
+            try:
+                scene_object.actor.prop.color = color
+            except Exception:
+                pass
+
+        object_type = scene_object.object_type
+
+        if object_type == "mesh":
+            try:
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.35, 0.80, 1.0)
+                prop.SetLineWidth(1.0)
+            except Exception:
+                pass
+
+            # Mantém transparência existente, mas torna a seleção
+            # suficientemente visível em qualquer modo de exibição.
+            try:
+                current_opacity = float(
+                    scene_object.selection_state.get(
+                        "opacity",
+                        prop.GetOpacity(),
+                    )
+                )
+                prop.SetOpacity(
+                    max(current_opacity, 0.62)
+                )
+            except Exception:
+                pass
+
+        elif object_type == "reference_plane":
+            try:
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.55, 1.0, 0.65)
+                prop.SetLineWidth(3.0)
+                prop.SetOpacity(
+                    max(
+                        float(prop.GetOpacity()),
+                        0.58,
+                    )
+                )
+            except Exception:
+                pass
+
+        elif object_type in {
+            "reference_cylinder",
+            "reference_axis",
+            "curve",
+            "sketch",
+        }:
+            try:
+                prop.SetLineWidth(
+                    max(
+                        float(prop.GetLineWidth()),
+                        4.0,
+                    )
+                )
+            except Exception:
+                pass
+
+        elif object_type == "reference_point":
+            try:
+                prop.SetOpacity(1.0)
+            except Exception:
+                pass
+
+    def _restore_selection_appearance(
+        self,
+        scene_object: SceneObject,
+    ) -> None:
+        """Restaura exatamente a aparência anterior."""
+
+        state = scene_object.selection_state or {}
+        prop = self._actor_property(scene_object)
+
+        if prop is None:
+            scene_object.selection_state = None
+            return
+
+        try:
+            color = state.get("color")
+
+            if color is not None:
+                prop.SetColor(*color)
+            else:
+                scene_object.actor.prop.color = (
+                    scene_object.base_color
+                )
+        except Exception:
+            try:
+                scene_object.actor.prop.color = (
+                    scene_object.base_color
+                )
+            except Exception:
+                pass
+
+        try:
+            edge_color = state.get("edge_color")
+
+            if edge_color is not None:
+                prop.SetEdgeColor(*edge_color)
+        except Exception:
+            pass
+
+        for key, setter_name in (
+            ("opacity", "SetOpacity"),
+            ("line_width", "SetLineWidth"),
+            ("edge_visibility", "SetEdgeVisibility"),
+        ):
+            value = state.get(key)
+            setter = getattr(
+                prop,
+                setter_name,
+                None,
+            )
+
+            if (
+                value is not None
+                and callable(setter)
+            ):
+                try:
+                    setter(value)
+                except Exception:
+                    pass
+
+        scene_object.selection_state = None
+
     def set_selected(
         self,
         object_id: str,
         selected: bool,
         render: bool = True,
     ) -> bool:
+        """Seleciona com destaque forte e restauração segura."""
+
         scene_object = self.get_object(object_id)
 
         if scene_object is None:
             return False
 
+        if scene_object.selected == selected:
+            return True
+
         scene_object.selected = selected
 
-        scene_object.actor.prop.color = (
-            self.SELECTION_COLOR
-            if selected
-            else scene_object.base_color
-        )
+        if selected:
+            scene_object.selection_state = (
+                self._capture_selection_state(
+                    scene_object
+                )
+            )
+            self._apply_selection_appearance(
+                scene_object
+            )
+        else:
+            self._restore_selection_appearance(
+                scene_object
+            )
 
         if render:
             self.viewer.render()
@@ -259,7 +483,10 @@ class SceneManager:
 
         self.viewer.render()
 
+
     def clear_selection(self) -> None:
+        """Limpa seleção restaurando todos os estados visuais."""
+
         changed = False
 
         for scene_object in self._objects.values():
@@ -267,8 +494,8 @@ class SceneManager:
                 continue
 
             scene_object.selected = False
-            scene_object.actor.prop.color = (
-                scene_object.base_color
+            self._restore_selection_appearance(
+                scene_object
             )
             changed = True
 

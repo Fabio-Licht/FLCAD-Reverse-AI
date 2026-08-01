@@ -570,3 +570,288 @@ def refine_cylindrical_cells(
         result,
         point_normals[unique_indices],
     )
+
+
+
+def merge_cylindrical_seed_regions(
+    regions: list[
+        tuple[MeshRegionResult, np.ndarray]
+    ],
+) -> tuple[
+    tuple[int, ...],
+    np.ndarray,
+    np.ndarray,
+    tuple[int, ...],
+]:
+    """
+    Combina regiões obtidas por várias sementes.
+
+    Pontos repetidos são removidos juntamente com suas normais.
+    O resultado pode ser usado como entrada de um único ajuste
+    cilíndrico, reduzindo a dependência do primeiro triângulo.
+    """
+
+    if not regions:
+        raise ValueError(
+            "Nenhuma região de semente foi fornecida."
+        )
+
+    cell_ids: set[int] = set()
+    seed_cell_ids: list[int] = []
+    all_points: list[np.ndarray] = []
+    all_normals: list[np.ndarray] = []
+
+    for region, normals in regions:
+        cell_ids.update(
+            int(value)
+            for value in region.cell_ids
+        )
+        seed_cell_ids.append(
+            int(region.seed_cell_id)
+        )
+
+        points = np.asarray(
+            region.points,
+            dtype=float,
+        )
+        normals_array = np.asarray(
+            normals,
+            dtype=float,
+        )
+
+        if points.shape != normals_array.shape:
+            raise ValueError(
+                "Pontos e normais das sementes não são compatíveis."
+            )
+
+        all_points.append(points)
+        all_normals.append(normals_array)
+
+    points = np.vstack(all_points)
+    normals = np.vstack(all_normals)
+
+    rounded = np.round(
+        points,
+        decimals=9,
+    )
+    _, unique_indices = np.unique(
+        rounded,
+        axis=0,
+        return_index=True,
+    )
+    unique_indices = np.sort(
+        unique_indices
+    )
+
+    return (
+        tuple(sorted(cell_ids)),
+        points[unique_indices],
+        normals[unique_indices],
+        tuple(seed_cell_ids),
+    )
+
+
+def refine_cylindrical_cells_multi_seed(
+    mesh: Any,
+    candidate_cell_ids: tuple[int, ...],
+    seed_cell_ids: tuple[int, ...],
+    cylinder_center: tuple[float, float, float],
+    axis_direction: tuple[float, float, float],
+    radius: float,
+    radial_tolerance: float,
+    normal_tolerance_degrees: float = 24.0,
+) -> tuple[MeshRegionResult, np.ndarray]:
+    """
+    Refina um cilindro preservando os componentes conectados a
+    qualquer uma das sementes selecionadas pelo usuário.
+    """
+
+    if not seed_cell_ids:
+        raise ValueError(
+            "É necessária ao menos uma semente cilíndrica."
+        )
+
+    working_mesh = mesh.compute_normals(
+        point_normals=True,
+        cell_normals=True,
+        consistent_normals=True,
+        auto_orient_normals=True,
+        inplace=False,
+    )
+
+    axis = np.asarray(
+        axis_direction,
+        dtype=float,
+    )
+    axis_length = float(
+        np.linalg.norm(axis)
+    )
+
+    if axis_length <= 1.0e-12:
+        raise ValueError(
+            "O eixo preliminar do cilindro é inválido."
+        )
+
+    axis = axis / axis_length
+    center = np.asarray(
+        cylinder_center,
+        dtype=float,
+    )
+    cell_normals = np.asarray(
+        working_mesh.cell_data["Normals"],
+        dtype=float,
+    )
+    maximum_axis_dot = sin(
+        radians(normal_tolerance_degrees)
+    )
+
+    accepted_set: set[int] = set()
+
+    for raw_cell_id in candidate_cell_ids:
+        cell_id = int(raw_cell_id)
+        cell = working_mesh.get_cell(
+            cell_id
+        )
+        points = np.asarray(
+            cell.points,
+            dtype=float,
+        )
+
+        if points.size == 0:
+            continue
+
+        cell_center = points.mean(axis=0)
+        relative = cell_center - center
+        axial = (
+            float(np.dot(relative, axis))
+            * axis
+        )
+        radial_distance = float(
+            np.linalg.norm(
+                relative - axial
+            )
+        )
+
+        normal = cell_normals[cell_id]
+        normal_length = float(
+            np.linalg.norm(normal)
+        )
+
+        if normal_length <= 1.0e-12:
+            continue
+
+        normal = normal / normal_length
+
+        if abs(
+            float(np.dot(normal, axis))
+        ) > maximum_axis_dot:
+            continue
+
+        if abs(
+            radial_distance - radius
+        ) > radial_tolerance:
+            continue
+
+        accepted_set.add(cell_id)
+
+    if not accepted_set:
+        raise ValueError(
+            "Nenhum triângulo permaneceu após o refinamento."
+        )
+
+    connected_set: set[int] = set()
+
+    for raw_seed_id in seed_cell_ids:
+        seed_id = int(raw_seed_id)
+
+        if seed_id not in accepted_set:
+            seed_id = min(
+                accepted_set,
+                key=lambda cell_id: abs(
+                    cell_id - seed_id
+                ),
+            )
+
+        queue: deque[int] = deque(
+            [seed_id]
+        )
+        visited: set[int] = set()
+
+        while queue:
+            cell_id = queue.popleft()
+
+            if (
+                cell_id in visited
+                or cell_id not in accepted_set
+            ):
+                continue
+
+            visited.add(cell_id)
+            connected_set.add(cell_id)
+
+            for neighbor_id in (
+                working_mesh.cell_neighbors(
+                    cell_id,
+                    connections="edges",
+                )
+            ):
+                neighbor_id = int(
+                    neighbor_id
+                )
+
+                if (
+                    neighbor_id in accepted_set
+                    and neighbor_id not in visited
+                ):
+                    queue.append(
+                        neighbor_id
+                    )
+
+    connected = sorted(
+        connected_set
+    )
+
+    if len(connected) < 5:
+        raise ValueError(
+            "A região cilíndrica refinada ficou pequena demais."
+        )
+
+    region_mesh = (
+        working_mesh.extract_cells(
+            connected
+        )
+    )
+    points = np.asarray(
+        region_mesh.points,
+        dtype=float,
+    )
+    point_normals = np.asarray(
+        region_mesh.point_data["Normals"],
+        dtype=float,
+    )
+
+    rounded = np.round(
+        points,
+        decimals=9,
+    )
+    _, unique_indices = np.unique(
+        rounded,
+        axis=0,
+        return_index=True,
+    )
+    unique_indices = np.sort(
+        unique_indices
+    )
+
+    result = MeshRegionResult(
+        cell_ids=tuple(connected),
+        points=points[unique_indices],
+        seed_cell_id=int(
+            seed_cell_ids[0]
+        ),
+    )
+
+    return (
+        result,
+        point_normals[unique_indices],
+    )

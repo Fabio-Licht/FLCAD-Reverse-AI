@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from itertools import count
+from types import SimpleNamespace
 from math import isfinite, sqrt
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -23,14 +24,18 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 from pyvistaqt import QtInteractor
+import vtk
 
 from core.command_history import CommandManager
+from core.command_preset_store import CommandPresetStore
 from core.project_commands import (
+    CompositeProjectCommand,
     CreateReferenceBatchCommand,
     CreateReferenceCommand,
     DeleteObjectsCommand,
     ImportMeshCommand,
     SetVisibilityCommand,
+    TransformSceneObjectsCommand,
 )
 from core.project_manager import ProjectManager
 from core.project_model import ProjectObjectMetadata
@@ -40,13 +45,30 @@ from geometry.reference_entities import (
     PlaneReference,
     PointReference,
 )
+from geometry.alignment_engine import (
+    pivot_rotation_transform,
+    plane_to_global_transform,
+    target_axis,
+)
 from geometry.cylinder_fit import fit_cylinder_to_points
+from geometry.cylinder_quality import (
+    CylinderQualityResult,
+    evaluate_cylinder_quality,
+)
 from geometry.mesh_region import (
     grow_cylindrical_region,
+    merge_cylindrical_seed_regions,
+    refine_cylindrical_cells_multi_seed,
     grow_planar_region,
     refine_cylindrical_cells,
 )
+from geometry.pattern_engine import (
+    PatternInstance,
+    create_circular_pattern,
+    create_linear_pattern,
+)
 from geometry.plane_fit import fit_plane_to_points
+from geometry.plane_quality import evaluate_plane_quality
 from geometry.reference_manager import ReferenceManager
 from mesh_io.stl_loader import load_stl
 from ui.delete_dialog import DeleteDialog
@@ -59,6 +81,9 @@ from ui.project_panel import ProjectPanel
 from visualization.engine.context_picker import ContextPicker
 from visualization.engine.navigation_manager import (
     NavigationManager,
+)
+from visualization.engine.reference_display import (
+    create_cylinder_reference_lines,
 )
 from visualization.engine.reference_factory import (
     ReferenceGeometryFactory,
@@ -76,7 +101,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle(
-            "FLCAD Reverse AI — v0.4.4 Genesis"
+            "FLCAD Reverse AI — v0.7.4 Genesis"
         )
         self.resize(1280, 800)
 
@@ -97,12 +122,26 @@ class MainWindow(QMainWindow):
         self._pending_plane_minimum_points = 50
         self._pending_plane_scale = 2.0
         self._pending_plane_maximum_angle = 12.0
+        self._plane_region_dialog = None
+        self._pending_plane_seed_point: tuple[
+            float,
+            float,
+            float,
+        ] | None = None
+        self._pending_plane_source_object_id: str | None = None
+        self._pending_plane_creation = None
 
         self._plane_region_preview_name = (
             "__flcad_plane_region_preview__"
         )
         self._plane_preview_name = (
             "__flcad_plane_preview__"
+        )
+        self._plane_center_preview_name = (
+            "__flcad_plane_center_preview__"
+        )
+        self._plane_normal_preview_name = (
+            "__flcad_plane_normal_preview__"
         )
 
         self._pending_cylinder_radius = 0.0
@@ -118,9 +157,34 @@ class MainWindow(QMainWindow):
         self._cylinder_axis_preview_name = (
             "__flcad_cylinder_axis_preview__"
         )
+        self._cylinder_center_preview_name = (
+            "__flcad_cylinder_center_preview__"
+        )
+        self._cylinder_pattern_preview_names: list[str] = []
 
         self._cylinder_preview_dialog = None
+        self._cylinder_region_dialog = None
         self._pending_cylinder_creation = None
+        self._editing_object_ids: set[str] = set()
+        self._pending_cylinder_seed_count = 1
+        self._pending_cylinder_seed_points: list[
+            tuple[float, float, float]
+        ] = []
+        self._pending_cylinder_source_object_id: str | None = None
+        self._cylinder_recognition_history: list[
+            dict[str, Any]
+        ] = []
+        self._cylinder_production_mode = False
+        self._cylinder_batch_queue: list[
+            dict[str, Any]
+        ] = []
+
+        # Seleção protegida: Ctrl + clique curto.
+        self._selection_press_position: tuple[int, int] | None = None
+        self._selection_press_control = False
+        self._selection_observer_ids: list[int] = []
+        self._selection_drag_tolerance_px = 5
+        self._selection_event_filter_installed = False
 
         self.viewer = QtInteractor(self)
         self.setCentralWidget(self.viewer)
@@ -156,6 +220,11 @@ class MainWindow(QMainWindow):
         self.project_panel.object_selection_toggled.connect(
             self.selection.toggle
         )
+        self.project_panel.object_double_clicked.connect(
+            self.edit_project_object
+        )
+
+        self.command_presets = CommandPresetStore()
 
         self.history = CommandManager()
         self.history.subscribe(
@@ -217,11 +286,18 @@ class MainWindow(QMainWindow):
         )
 
         self.select_action = QAction(
-            "Selecionar objetos",
+            "Selecionar objetos (Ctrl+clique)",
             self,
         )
         self.select_action.setCheckable(True)
         self.select_action.setShortcut("S")
+        self.select_action.setToolTip(
+            (
+                "Ativa a seleção protegida. Use Ctrl + clique "
+                "curto para selecionar; arrastar com o botão "
+                "esquerdo continua reservado para rotacionar."
+            )
+        )
         self.select_action.toggled.connect(
             self.set_selection_mode
         )
@@ -249,7 +325,41 @@ class MainWindow(QMainWindow):
 
         self._create_reference_menu(toolbar)
         self._create_recognition_menu(toolbar)
+        self._create_alignment_menu(toolbar)
         self._create_visualization_menu(toolbar)
+
+        settings_menu = QMenu("Configurações", self)
+        clear_last_action = QAction(
+            "Limpar dados dos últimos comandos",
+            self,
+        )
+        clear_last_action.triggered.connect(
+            self.clear_command_presets
+        )
+        settings_menu.addAction(clear_last_action)
+
+        settings_button = QToolButton(self)
+        settings_button.setText("Configurações")
+        settings_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        settings_button.setMenu(settings_menu)
+        toolbar.addWidget(settings_button)
+
+
+    def clear_command_presets(self) -> None:
+        """Apaga os parâmetros lembrados sem alterar o projeto."""
+        answer = QMessageBox.question(
+            self,
+            "Limpar dados lembrados",
+            "Deseja restaurar os valores padrão de todos os comandos?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.command_presets.clear()
+        self.statusBar().showMessage("Dados dos últimos comandos restaurados")
 
     def _create_reference_menu(
         self,
@@ -376,6 +486,559 @@ class MainWindow(QMainWindow):
             recognition_button
         )
         toolbar.addSeparator()
+
+
+    def _create_alignment_menu(
+        self,
+        toolbar: QToolBar,
+    ) -> None:
+        """Cria a primeira fundação do sistema de alinhamento."""
+
+        alignment_menu = QMenu(
+            "Alinhamento",
+            self,
+        )
+
+        cylinder_menu = alignment_menu.addMenu(
+            "Orientar eixo selecionado"
+        )
+
+        for label, axis_name in (
+            ("Para X+", "x"),
+            ("Para Y+", "y"),
+            ("Para Z+", "z"),
+            ("Para X−", "x-"),
+            ("Para Y−", "y-"),
+            ("Para Z−", "z-"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda checked=False, value=axis_name:
+                self.align_selected_axis_to_global(
+                    value
+                )
+            )
+            cylinder_menu.addAction(action)
+
+        plane_menu = alignment_menu.addMenu(
+            "Alinhar plano selecionado"
+        )
+
+        for label, axis_name in (
+            ("Assentar em XY — normal Z+", "z"),
+            ("Assentar em XY — normal Z−", "z-"),
+            ("Assentar em XZ — normal Y+", "y"),
+            ("Assentar em XZ — normal Y−", "y-"),
+            ("Assentar em YZ — normal X+", "x"),
+            ("Assentar em YZ — normal X−", "x-"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda checked=False, value=axis_name:
+                self.align_selected_plane_to_global(
+                    value,
+                    seat_on_global_plane=True,
+                )
+            )
+            plane_menu.addAction(action)
+
+        orient_only_menu = plane_menu.addMenu(
+            "Somente orientar normal"
+        )
+
+        for label, axis_name in (
+            ("Normal para X+", "x"),
+            ("Normal para Y+", "y"),
+            ("Normal para Z+", "z"),
+            ("Normal para X−", "x-"),
+            ("Normal para Y−", "y-"),
+            ("Normal para Z−", "z-"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda checked=False, value=axis_name:
+                self.align_selected_plane_to_global(
+                    value,
+                    seat_on_global_plane=False,
+                )
+            )
+            orient_only_menu.addAction(action)
+
+        alignment_menu.addSeparator()
+
+        help_action = QAction(
+            "Como usar o alinhamento",
+            self,
+        )
+        help_action.triggered.connect(
+            self.show_alignment_help
+        )
+        alignment_menu.addAction(
+            help_action
+        )
+
+        alignment_button = QToolButton(self)
+        alignment_button.setText(
+            "Alinhamento"
+        )
+        alignment_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        alignment_button.setMenu(
+            alignment_menu
+        )
+
+        toolbar.addWidget(
+            alignment_button
+        )
+        toolbar.addSeparator()
+
+    def show_alignment_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "Alinhamento por eixo",
+            (
+                "ALINHAMENTO POR EIXO\n"
+                "1. Ative Selecionar objetos.\n"
+                "2. Selecione uma malha.\n"
+                "3. Selecione um cilindro ou eixo.\n"
+                "4. Escolha X, Y ou Z.\n\n"
+                "ALINHAMENTO POR PLANO\n"
+                "1. Selecione uma malha e um plano.\n"
+                "2. Escolha XY, XZ ou YZ.\n"
+                "3. Escolha o sentido positivo ou negativo da normal.\n\n"
+                "Assentar orienta a normal e leva a origem do plano "
+                "para o plano global correspondente. Tudo pode ser desfeito."
+            ),
+        )
+
+    def _alignment_reference_data(
+        self,
+        object_id: str,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None:
+        project_object = self.project.get_object(
+            object_id
+        )
+
+        if project_object is None:
+            return None
+
+        data = getattr(
+            project_object,
+            "data",
+            None,
+        )
+
+        if isinstance(data, CylinderReference):
+            return (
+                tuple(data.center),
+                tuple(data.axis_direction),
+            )
+
+        if isinstance(data, AxisReference):
+            return (
+                tuple(data.origin),
+                tuple(data.direction),
+            )
+
+        return None
+
+
+    def _plane_alignment_reference_data(
+        self,
+        object_id: str,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None:
+        """Obtém origem e normal de um plano de referência."""
+
+        project_object = self.project.get_object(
+            object_id
+        )
+
+        if project_object is None:
+            return None
+
+        data = getattr(
+            project_object,
+            "data",
+            None,
+        )
+
+        if not isinstance(data, PlaneReference):
+            return None
+
+        return (
+            tuple(data.origin),
+            tuple(data.normal),
+        )
+
+    def _alignment_related_objects(
+        self,
+        mesh_id: str,
+        reference_id: str,
+    ) -> set[str]:
+        """
+        Inclui a malha e referências dependentes para que permaneçam
+        visualmente coerentes após a rotação.
+        """
+
+        related = {
+            mesh_id,
+            reference_id,
+        }
+        changed = True
+
+        while changed:
+            changed = False
+
+            for object_id in self.scene.object_ids():
+                if object_id in related:
+                    continue
+
+                project_object = (
+                    self.project.get_object(
+                        object_id
+                    )
+                )
+
+                if project_object is None:
+                    continue
+
+                metadata = getattr(
+                    project_object,
+                    "metadata",
+                    None,
+                )
+                source_id = getattr(
+                    metadata,
+                    "source_object_id",
+                    None,
+                )
+
+                if source_id in related:
+                    related.add(object_id)
+                    changed = True
+
+        return related
+
+
+    def align_selected_plane_to_global(
+        self,
+        axis_name: str,
+        *,
+        seat_on_global_plane: bool,
+    ) -> None:
+        """Alinha uma malha usando um plano reconhecido."""
+
+        selected_ids = set(
+            self.selection.selected_ids()
+        )
+
+        mesh_ids = [
+            object_id
+            for object_id in selected_ids
+            if (
+                self.scene.get_object(object_id)
+                is not None
+                and self.scene.get_object(
+                    object_id
+                ).object_type == "mesh"
+            )
+        ]
+
+        plane_ids = [
+            object_id
+            for object_id in selected_ids
+            if (
+                self.scene.get_object(object_id)
+                is not None
+                and self.scene.get_object(
+                    object_id
+                ).object_type
+                == "reference_plane"
+            )
+        ]
+
+        if (
+            len(mesh_ids) != 1
+            or len(plane_ids) != 1
+        ):
+            QMessageBox.information(
+                self,
+                "Seleção para alinhamento por plano",
+                (
+                    "Selecione exatamente:\\n\\n"
+                    "• uma malha;\\n"
+                    "• um plano de referência.\\n\\n"
+                    "Use Ctrl + clique curto na viewport "
+                    "ou selecione pela árvore."
+                ),
+            )
+            return
+
+        mesh_id = mesh_ids[0]
+        plane_id = plane_ids[0]
+
+        reference_data = (
+            self._plane_alignment_reference_data(
+                plane_id
+            )
+        )
+
+        if reference_data is None:
+            QMessageBox.warning(
+                self,
+                "Plano incompatível",
+                "O plano selecionado não possui origem e normal válidas.",
+            )
+            return
+
+        plane_origin, plane_normal = (
+            reference_data
+        )
+
+        try:
+            transform = plane_to_global_transform(
+                plane_origin=plane_origin,
+                plane_normal=plane_normal,
+                target_normal=target_axis(
+                    axis_name
+                ),
+                seat_on_global_plane=(
+                    seat_on_global_plane
+                ),
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Erro no alinhamento por plano",
+                str(error),
+            )
+            return
+
+        plane_names = {
+            "x": "YZ / X+",
+            "x-": "YZ / X−",
+            "y": "XZ / Y+",
+            "y-": "XZ / Y−",
+            "z": "XY / Z+",
+            "z-": "XY / Z−",
+        }
+        target_label = plane_names.get(
+            axis_name,
+            axis_name.upper(),
+        )
+
+        operation_text = (
+            "orientar e assentar"
+            if seat_on_global_plane
+            else "somente orientar"
+        )
+
+        answer = QMessageBox.question(
+            self,
+            "Confirmar alinhamento por plano",
+            (
+                f"Deseja {operation_text} o plano em {target_label}?\\n\\n"
+                "A malha e suas referências dependentes serão "
+                "transformadas juntas."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        object_ids = (
+            self._alignment_related_objects(
+                mesh_id,
+                plane_id,
+            )
+        )
+
+        description = (
+            f"Alinhar plano em {target_label}"
+            if seat_on_global_plane
+            else (
+                f"Orientar normal do plano para "
+                f"{axis_name.upper()}"
+            )
+        )
+
+        command = TransformSceneObjectsCommand(
+            scene=self.scene,
+            object_ids=object_ids,
+            transform=transform,
+            description=description,
+        )
+
+        self.history.execute(command)
+        self.selection.deactivate(
+            clear_selection=True
+        )
+        self.select_action.blockSignals(True)
+        self.select_action.setChecked(False)
+        self.select_action.blockSignals(False)
+
+        self.statusBar().showMessage(
+            (
+                f"Alinhamento por plano aplicado: {target_label} | "
+                f"{len(object_ids)} objeto(s) transformado(s)"
+            )
+        )
+
+    def align_selected_axis_to_global(
+        self,
+        axis_name: str,
+    ) -> None:
+        """Orienta uma malha por um cilindro ou eixo selecionado."""
+
+        selected_ids = set(
+            self.selection.selected_ids()
+        )
+
+        mesh_ids = [
+            object_id
+            for object_id in selected_ids
+            if (
+                self.scene.get_object(object_id)
+                is not None
+                and self.scene.get_object(
+                    object_id
+                ).object_type == "mesh"
+            )
+        ]
+
+        reference_ids = [
+            object_id
+            for object_id in selected_ids
+            if (
+                self.scene.get_object(object_id)
+                is not None
+                and self.scene.get_object(
+                    object_id
+                ).object_type
+                in {
+                    "reference_cylinder",
+                    "reference_axis",
+                }
+            )
+        ]
+
+        if (
+            len(mesh_ids) != 1
+            or len(reference_ids) != 1
+        ):
+            QMessageBox.information(
+                self,
+                "Seleção para alinhamento",
+                (
+                    "Selecione exatamente:\n\n"
+                    "• uma malha;\n"
+                    "• um cilindro ou eixo de referência."
+                ),
+            )
+            return
+
+        mesh_id = mesh_ids[0]
+        reference_id = reference_ids[0]
+        reference_data = (
+            self._alignment_reference_data(
+                reference_id
+            )
+        )
+
+        if reference_data is None:
+            QMessageBox.warning(
+                self,
+                "Referência incompatível",
+                "A referência selecionada não possui eixo utilizável.",
+            )
+            return
+
+        pivot, source_direction = (
+            reference_data
+        )
+
+        try:
+            transform = pivot_rotation_transform(
+                source_direction=(
+                    source_direction
+                ),
+                target_direction=target_axis(
+                    axis_name
+                ),
+                pivot=pivot,
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Erro no alinhamento",
+                str(error),
+            )
+            return
+
+        target_label = axis_name.upper()
+
+        answer = QMessageBox.question(
+            self,
+            "Confirmar alinhamento",
+            (
+                f"Orientar o eixo selecionado para {target_label}?\n\n"
+                "A malha e as referências dependentes serão "
+                "rotacionadas ao redor da referência."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        object_ids = (
+            self._alignment_related_objects(
+                mesh_id,
+                reference_id,
+            )
+        )
+
+        command = TransformSceneObjectsCommand(
+            scene=self.scene,
+            object_ids=object_ids,
+            transform=transform,
+            description=(
+                f"Alinhar eixo para {target_label}"
+            ),
+        )
+
+        self.history.execute(command)
+        self.selection.deactivate(
+            clear_selection=True
+        )
+        self.select_action.blockSignals(True)
+        self.select_action.setChecked(False)
+        self.select_action.blockSignals(False)
+
+        self.statusBar().showMessage(
+            (
+                f"Alinhamento aplicado: eixo → {target_label} | "
+                f"{len(object_ids)} objeto(s) transformado(s)"
+            )
+        )
 
     def _create_visualization_menu(
         self,
@@ -988,35 +1651,78 @@ class MainWindow(QMainWindow):
             f"Criado: {record.name}"
         )
 
+
     def start_plane_region_mode(self) -> None:
-        """Solicita parâmetros e ativa a captura da região plana."""
+        """Abre o painel não modal de reconhecimento de planos."""
 
-        mesh_objects = self.scene.objects_by_type(
-            "mesh"
-        )
-
-        if not mesh_objects:
+        if not self.scene.objects_by_type("mesh"):
             QMessageBox.information(
                 self,
                 "Nenhuma malha disponível",
-                (
-                    "Importe uma malha antes de reconhecer "
-                    "uma região plana."
-                ),
+                "Importe uma malha antes de reconhecer um plano.",
             )
+            return
+
+        if (
+            self._plane_region_dialog is not None
+            and self._plane_region_dialog.isVisible()
+        ):
+            self._plane_region_dialog.raise_()
+            self._plane_region_dialog.activateWindow()
             return
 
         default_radius = max(
             self._reference_scale() * 0.05,
             1.0,
         )
+        preset = self.command_presets.load(
+            "recognize_plane_region",
+            {
+                "region_radius": default_radius,
+                "maximum_angle": 12.0,
+                "minimum_points": 50,
+                "plane_scale": 2.0,
+                "auto_recalculate": True,
+            },
+        )
 
         dialog = PlaneRegionDialog(
             default_radius=default_radius,
+            preset=preset,
             parent=self,
         )
+        self._plane_region_dialog = dialog
 
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog.selection_requested.connect(
+            self.begin_plane_region_selection
+        )
+        dialog.recalculate_requested.connect(
+            self.recalculate_plane_from_seed
+        )
+        dialog.create_requested.connect(
+            self.create_pending_plane
+        )
+        dialog.clear_requested.connect(
+            self.clear_plane_region_state
+        )
+        dialog.cancel_requested.connect(
+            self.cancel_plane_region_mode
+        )
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        self.statusBar().showMessage(
+            "Painel de reconhecimento de plano aberto"
+        )
+
+    def begin_plane_region_selection(self) -> None:
+        """Ativa um clique de região mantendo o painel aberto."""
+
+        dialog = self._plane_region_dialog
+
+        if dialog is None:
             return
 
         self._pending_plane_radius = (
@@ -1031,9 +1737,15 @@ class MainWindow(QMainWindow):
         self._pending_plane_scale = (
             dialog.plane_scale()
         )
+        self.command_presets.save(
+            "recognize_plane_region",
+            dialog.preset_values(),
+        )
 
-        if self.delete_mode_active:
-            self.cancel_delete_mode()
+        self._pending_plane_seed_point = None
+        self._pending_plane_source_object_id = None
+        self._pending_plane_creation = None
+        self._clear_plane_region_preview()
 
         self.disable_selection_mode()
 
@@ -1054,21 +1766,18 @@ class MainWindow(QMainWindow):
             picker="cell",
         )
 
-        self.statusBar().showMessage(
-            "Clique no centro aproximado da região plana"
+        dialog.set_selection_active(True)
+        dialog.status_label.setText(
+            "Clique no centro aproximado da região plana."
         )
-
 
     def on_plane_region_picked(
         self,
         point: Any,
     ) -> None:
-        """Expande, mostra e confirma uma região plana."""
+        """Registra a semente e calcula o primeiro resultado."""
 
         if point is None or len(point) < 3:
-            self.statusBar().showMessage(
-                "Nenhum ponto válido foi identificado"
-            )
             return
 
         picked_point = (
@@ -1076,145 +1785,221 @@ class MainWindow(QMainWindow):
             float(point[1]),
             float(point[2]),
         )
+        source_object = self._nearest_mesh_object(
+            picked_point
+        )
+
+        if source_object is None:
+            dialog = self._plane_region_dialog
+            if dialog is not None:
+                dialog.set_error(
+                    "Não foi possível localizar a malha clicada."
+                )
+            return
+
+        self._pending_plane_seed_point = picked_point
+        self._pending_plane_source_object_id = (
+            source_object.object_id
+        )
 
         try:
             self.viewer.disable_picking()
         except Exception:
             pass
 
-        source_object = self._nearest_mesh_object(
-            picked_point
+        dialog = self._plane_region_dialog
+        if dialog is not None:
+            dialog.set_selection_active(False)
+            dialog.set_seed_selected()
+
+        self.recalculate_plane_from_seed()
+
+    def recalculate_plane_from_seed(self) -> None:
+        """Reutiliza a mesma semente com os parâmetros atuais."""
+
+        dialog = self._plane_region_dialog
+
+        if dialog is None:
+            return
+
+        if self._pending_plane_seed_point is None:
+            dialog.set_error(
+                "Selecione uma região antes de recalcular."
+            )
+            return
+
+        source_object = self.scene.get_object(
+            self._pending_plane_source_object_id
         )
 
         if source_object is None:
-            QMessageBox.warning(
-                self,
-                "Região não encontrada",
-                (
-                    "Não foi possível localizar uma malha "
-                    "próxima ao ponto clicado."
-                ),
+            dialog.set_error(
+                "A malha selecionada não está mais disponível."
             )
             return
+
+        self._pending_plane_radius = (
+            dialog.region_radius()
+        )
+        self._pending_plane_minimum_points = (
+            dialog.minimum_points()
+        )
+        self._pending_plane_maximum_angle = (
+            dialog.maximum_angle()
+        )
+        self._pending_plane_scale = (
+            dialog.plane_scale()
+        )
+        self.command_presets.save(
+            "recognize_plane_region",
+            dialog.preset_values(),
+        )
+
+        dialog.set_calculation_in_progress(True)
 
         try:
             region_result = grow_planar_region(
                 mesh=source_object.data,
-                seed_point=picked_point,
+                seed_point=(
+                    self._pending_plane_seed_point
+                ),
                 radius=self._pending_plane_radius,
                 maximum_angle_degrees=(
                     self._pending_plane_maximum_angle
                 ),
             )
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Erro na expansão da região",
-                str(error),
-            )
-            return
 
-        if (
-            region_result.point_count
-            < self._pending_plane_minimum_points
-        ):
-            QMessageBox.warning(
-                self,
-                "Poucos pontos na região",
-                (
-                    f"A expansão encontrou "
-                    f"{region_result.point_count} pontos, "
-                    "mas o mínimo configurado é "
-                    f"{self._pending_plane_minimum_points}.\n\n"
-                    "Aumente o raio ou o limite angular."
-                ),
-            )
-            return
+            if (
+                region_result.point_count
+                < self._pending_plane_minimum_points
+            ):
+                raise ValueError(
+                    (
+                        f"A expansão encontrou "
+                        f"{region_result.point_count} pontos; "
+                        f"o mínimo é "
+                        f"{self._pending_plane_minimum_points}."
+                    )
+                )
 
-        try:
             fit_result = fit_plane_to_points(
                 region_result.points
             )
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Erro no ajuste do plano",
-                str(error),
+            normal = self._orient_normal_to_camera(
+                fit_result.origin,
+                fit_result.normal,
             )
+            plane_size = max(
+                self._pending_plane_radius
+                * self._pending_plane_scale,
+                1.0,
+            )
+            entity = PlaneReference(
+                origin=fit_result.origin,
+                normal=normal,
+                size_x=plane_size,
+                size_y=plane_size,
+            )
+
+            quality = evaluate_plane_quality(
+                points=region_result.points,
+                origin=fit_result.origin,
+                normal=normal,
+                rms_error=fit_result.rms_error,
+                maximum_error=fit_result.maximum_error,
+                region_radius=self._pending_plane_radius,
+            )
+
+            region_geometry = (
+                source_object.data.extract_cells(
+                    list(region_result.cell_ids)
+                )
+            )
+
+            self._show_plane_region_preview(
+                region_geometry=region_geometry,
+                plane_entity=entity,
+            )
+
+        except Exception as error:
+            self._pending_plane_creation = None
+            self._clear_plane_region_preview()
+            dialog.set_error(str(error))
             return
 
-        normal = self._orient_normal_to_camera(
-            fit_result.origin,
-            fit_result.normal,
-        )
+        self._pending_plane_creation = {
+            "source_object": source_object,
+            "region_result": region_result,
+            "fit_result": fit_result,
+            "entity": entity,
+            "seed_point": (
+                self._pending_plane_seed_point
+            ),
+            "quality": quality,
+        }
 
-        plane_size = max(
-            self._pending_plane_radius
-            * self._pending_plane_scale,
-            1.0,
-        )
-
-        preview_entity = PlaneReference(
-            origin=fit_result.origin,
-            normal=normal,
-            size_x=plane_size,
-            size_y=plane_size,
-        )
-
-        region_geometry = (
-            source_object.data.extract_cells(
-                list(region_result.cell_ids)
-            )
-        )
-
-        self._show_plane_region_preview(
-            region_geometry=region_geometry,
-            plane_entity=preview_entity,
-        )
-
-        preview_dialog = PlanePreviewDialog(
+        dialog.set_result(
+            rms_error=fit_result.rms_error,
+            maximum_error=fit_result.maximum_error,
+            point_count=fit_result.point_count,
             triangle_count=(
                 region_result.triangle_count
             ),
-            point_count=region_result.point_count,
-            rms_error=fit_result.rms_error,
-            maximum_error=(
-                fit_result.maximum_error
-            ),
             normal=normal,
-            parent=self,
+            quality_score=quality.score,
+            quality_grade=quality.grade,
+            quality_stars=quality.stars,
+            mean_absolute_error=(
+                quality.mean_absolute_error
+            ),
+            standard_deviation=(
+                quality.standard_deviation
+            ),
+            inlier_ratio=quality.inlier_ratio,
+            quality_reasons=quality.reasons,
         )
 
-        accepted = (
-            preview_dialog.exec()
-            == QDialog.DialogCode.Accepted
+        self.statusBar().showMessage(
+            (
+                f"Plano recalculado | "
+                f"RMS {fit_result.rms_error:.4f} mm | "
+                f"{region_result.triangle_count} triângulos | "
+                f"{quality.grade} {quality.score:.1f}%"
+            )
         )
 
-        self._clear_plane_region_preview()
+    def create_pending_plane(self) -> None:
+        """Cria o plano atualmente exibido no painel."""
 
-        if not accepted:
-            self.statusBar().showMessage(
-                "Criação do plano cancelada"
+        pending = self._pending_plane_creation
+
+        if pending is None:
+            QMessageBox.information(
+                self,
+                "Resultado inexistente",
+                "Calcule um plano válido antes de criar.",
             )
             return
 
+        entity = pending["entity"]
+        source_object = pending["source_object"]
+        region_result = pending["region_result"]
+        fit_result = pending["fit_result"]
+
         record = self.references.create_record(
-            preview_entity
+            entity
         )
-
-        display_geometry = (
-            self.reference_factory.create_plane(
-                preview_entity
-            )
-        )
-
         command = CreateReferenceCommand(
             scene=self.scene,
             project_panel=self.project_panel,
             project_manager=self.project,
             reference_manager=self.references,
             record=record,
-            display_geometry=display_geometry,
+            display_geometry=(
+                self.reference_factory.create_plane(
+                    entity
+                )
+            ),
             render_options={
                 "color": "#ffd166",
                 "opacity": 0.28,
@@ -1250,6 +2035,33 @@ class MainWindow(QMainWindow):
                     "maximum_angle_degrees": (
                         self._pending_plane_maximum_angle
                     ),
+                    "plane_scale": (
+                        self._pending_plane_scale
+                    ),
+                    "quality_score": (
+                        pending["quality"].score
+                    ),
+                    "quality_grade": (
+                        pending["quality"].grade
+                    ),
+                    "quality_stars": (
+                        pending["quality"].stars
+                    ),
+                    "mean_absolute_error": (
+                        pending["quality"].mean_absolute_error
+                    ),
+                    "standard_deviation": (
+                        pending["quality"].standard_deviation
+                    ),
+                    "inlier_ratio": (
+                        pending["quality"].inlier_ratio
+                    ),
+                    "quality_reasons": list(
+                        pending["quality"].reasons
+                    ),
+                    "seed_point": tuple(
+                        pending["seed_point"]
+                    ),
                     "source_cell_ids": list(
                         region_result.cell_ids
                     ),
@@ -1259,11 +2071,53 @@ class MainWindow(QMainWindow):
 
         self.history.execute(command)
         self.viewer.render()
+        self.clear_plane_region_state()
+
+        dialog = self._plane_region_dialog
+        if dialog is not None:
+            dialog.status_label.setText(
+                (
+                    f"Criado: {record.name}. "
+                    "Você pode selecionar outra região."
+                )
+            )
 
         self.statusBar().showMessage(
-            f"Criado: {record.name} | "
-            f"{region_result.triangle_count} triângulos | "
-            f"RMS {fit_result.rms_error:.4f} mm"
+            f"Criado: {record.name}"
+        )
+
+    def clear_plane_region_state(self) -> None:
+        """Limpa semente e prévia sem fechar o painel."""
+
+        self._pending_plane_seed_point = None
+        self._pending_plane_source_object_id = None
+        self._pending_plane_creation = None
+        self._clear_plane_region_preview()
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        dialog = self._plane_region_dialog
+        if dialog is not None:
+            dialog.clear_state()
+
+    def cancel_plane_region_mode(self) -> None:
+        """Encerra o painel interativo de planos."""
+
+        self.clear_plane_region_state()
+
+        dialog = self._plane_region_dialog
+        self._plane_region_dialog = None
+
+        if dialog is not None:
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
+
+        self.statusBar().showMessage(
+            "Reconhecimento de plano cancelado"
         )
 
     def _nearest_mesh_object(
@@ -1324,12 +2178,13 @@ class MainWindow(QMainWindow):
 
         return best_object
 
+
     def _show_plane_region_preview(
         self,
         region_geometry: Any,
         plane_entity: PlaneReference,
     ) -> None:
-        """Mostra os triângulos usados e o plano provisório."""
+        """Mostra região, plano, centro e normal provisórios."""
 
         self._clear_plane_region_preview(
             render=False
@@ -1346,19 +2201,10 @@ class MainWindow(QMainWindow):
             lighting=False,
         )
 
-        try:
-            region_actor.SetPickable(False)
-        except Exception:
-            pass
-
-        plane_geometry = (
+        plane_actor = self.viewer.add_mesh(
             self.reference_factory.create_plane(
                 plane_entity
-            )
-        )
-
-        plane_actor = self.viewer.add_mesh(
-            plane_geometry,
+            ),
             name=self._plane_preview_name,
             color="#4ecdc4",
             opacity=0.32,
@@ -1368,13 +2214,60 @@ class MainWindow(QMainWindow):
             lighting=False,
         )
 
-        try:
-            plane_actor.SetPickable(False)
-        except Exception:
-            pass
+        center_entity = PointReference(
+            position=tuple(
+                plane_entity.origin
+            )
+        )
+        center_actor = self.viewer.add_mesh(
+            self.reference_factory.create_point(
+                center_entity,
+                radius=max(
+                    self._reference_scale() * 0.004,
+                    0.30,
+                ),
+            ),
+            name=self._plane_center_preview_name,
+            color="#ff7a45",
+            smooth_shading=True,
+            ambient=0.8,
+            diffuse=0.2,
+        )
+
+        normal_entity = AxisReference(
+            origin=tuple(
+                plane_entity.origin
+            ),
+            direction=tuple(
+                plane_entity.normal
+            ),
+            display_length=max(
+                plane_entity.size_x * 0.75,
+                1.0,
+            ),
+        )
+        normal_actor = self.viewer.add_mesh(
+            self.reference_factory.create_axis(
+                normal_entity
+            ),
+            name=self._plane_normal_preview_name,
+            color="#4ea1ff",
+            lighting=False,
+            ambient=1.0,
+        )
+
+        for actor in (
+            region_actor,
+            plane_actor,
+            center_actor,
+            normal_actor,
+        ):
+            try:
+                actor.SetPickable(False)
+            except Exception:
+                pass
 
         self.viewer.render()
-
     def _clear_plane_region_preview(
         self,
         render: bool = True,
@@ -1384,6 +2277,8 @@ class MainWindow(QMainWindow):
         for actor_name in (
             self._plane_region_preview_name,
             self._plane_preview_name,
+            self._plane_center_preview_name,
+            self._plane_normal_preview_name,
         ):
             try:
                 self.viewer.remove_actor(
@@ -1428,8 +2323,658 @@ class MainWindow(QMainWindow):
         )
 
 
+
+    def _metadata_custom(
+        self,
+        project_object: Any,
+    ) -> dict[str, Any]:
+        """Obtém metadados personalizados com tolerância a versões."""
+
+        metadata = getattr(
+            project_object,
+            "metadata",
+            None,
+        )
+
+        custom = getattr(
+            metadata,
+            "custom",
+            None,
+        )
+
+        return (
+            dict(custom)
+            if isinstance(custom, dict)
+            else {}
+        )
+
+    def _objects_in_pattern(
+        self,
+        pattern_id: str | None,
+        master_id: str,
+    ) -> set[str]:
+        """Localiza o mestre, instâncias e referências derivadas."""
+
+        result = {master_id}
+
+        if not pattern_id:
+            for object_id in self.scene.object_ids():
+                project_object = (
+                    self.project.get_object(
+                        object_id
+                    )
+                )
+
+                if project_object is None:
+                    continue
+
+                metadata = getattr(
+                    project_object,
+                    "metadata",
+                    None,
+                )
+                source_object_id = getattr(
+                    metadata,
+                    "source_object_id",
+                    None,
+                )
+
+                if source_object_id == master_id:
+                    result.add(object_id)
+
+            return result
+
+        for object_id in self.scene.object_ids():
+            project_object = self.project.get_object(
+                object_id
+            )
+
+            if project_object is None:
+                continue
+
+            custom = self._metadata_custom(
+                project_object
+            )
+
+            if custom.get("pattern_id") == pattern_id:
+                result.add(object_id)
+
+        return result
+
+    def edit_project_object(
+        self,
+        object_id: str,
+    ) -> None:
+        """Reabre propriedades ao dar duplo clique na árvore."""
+
+        scene_object = self.scene.get_object(
+            object_id
+        )
+
+        if (
+            scene_object is None
+            or scene_object.object_type
+            != "reference_cylinder"
+        ):
+            self.statusBar().showMessage(
+                "A edição por duplo clique está disponível "
+                "nesta versão para cilindros"
+            )
+            return
+
+        project_object = self.project.get_object(
+            object_id
+        )
+
+        if project_object is None:
+            QMessageBox.warning(
+                self,
+                "Referência indisponível",
+                "Não foi possível recuperar os dados do cilindro.",
+            )
+            return
+
+        custom = self._metadata_custom(
+            project_object
+        )
+
+        master_id = str(
+            custom.get(
+                "pattern_master_id",
+                object_id,
+            )
+            or object_id
+        )
+
+        master_project_object = (
+            self.project.get_object(
+                master_id
+            )
+        )
+
+        if master_project_object is None:
+            master_project_object = project_object
+            master_id = object_id
+
+        entity = getattr(
+            master_project_object,
+            "data",
+            None,
+        )
+
+        if not isinstance(
+            entity,
+            CylinderReference,
+        ):
+            QMessageBox.warning(
+                self,
+                "Tipo incompatível",
+                "O objeto selecionado não contém um cilindro editável.",
+            )
+            return
+
+        master_custom = self._metadata_custom(
+            master_project_object
+        )
+        master_metadata = getattr(
+            master_project_object,
+            "metadata",
+            None,
+        )
+
+        detected_diameter = float(
+            master_custom.get(
+                "detected_diameter",
+                entity.diameter,
+            )
+            or entity.diameter
+        )
+        detected_center = tuple(
+            master_custom.get(
+                "detected_center",
+                entity.center,
+            )
+            or entity.center
+        )
+        detected_direction = tuple(
+            master_custom.get(
+                "detected_direction",
+                entity.axis_direction,
+            )
+            or entity.axis_direction
+        )
+
+        stored_extension_factor = float(
+            master_custom.get(
+                "extension_factor",
+                1.0,
+            )
+            or 1.0
+        )
+        stored_length_mode = str(
+            master_custom.get(
+                "length_mode",
+                CylinderPreviewDialog.LENGTH_REGION,
+            )
+        )
+
+        recognized_length = master_custom.get(
+            "recognized_length",
+            None,
+        )
+
+        if recognized_length is None:
+            if (
+                stored_length_mode
+                == CylinderPreviewDialog.LENGTH_EXTENDED
+                and stored_extension_factor > 1.0e-12
+            ):
+                recognized_length = (
+                    float(entity.length)
+                    / stored_extension_factor
+                )
+            else:
+                recognized_length = float(
+                    entity.length
+                )
+
+        recognized_length = max(
+            float(recognized_length),
+            1.0e-9,
+        )
+
+        source_object_id = getattr(
+            master_metadata,
+            "source_object_id",
+            None,
+        )
+        source_object = (
+            self.scene.get_object(
+                source_object_id
+            )
+            if source_object_id
+            else None
+        )
+
+        if source_object is None:
+            source_object = SimpleNamespace(
+                object_id=(
+                    source_object_id
+                    or master_id
+                )
+            )
+
+        region_dialog = self._cylinder_region_dialog
+        self._cylinder_region_dialog = None
+        self._cylinder_recognition_history = []
+
+        if region_dialog is not None:
+            region_dialog.blockSignals(True)
+            region_dialog.close()
+            region_dialog.deleteLater()
+
+        dialog = CylinderPreviewDialog(
+            triangle_count=int(
+                master_custom.get(
+                    "triangle_count",
+                    0,
+                )
+                or 0
+            ),
+            point_count=int(
+                master_custom.get(
+                    "point_count",
+                    0,
+                )
+                or 0
+            ),
+            diameter=detected_diameter,
+            length=recognized_length,
+            rms_error=float(
+                getattr(
+                    master_metadata,
+                    "rms_error",
+                    0.0,
+                )
+                or 0.0
+            ),
+            maximum_error=float(
+                master_custom.get(
+                    "maximum_error",
+                    0.0,
+                )
+                or 0.0
+            ),
+            coverage_angle=float(
+                master_custom.get(
+                    "coverage_angle",
+                    getattr(
+                        entity,
+                        "coverage_angle",
+                        0.0,
+                    ),
+                )
+                or 0.0
+            ),
+            center=tuple(
+                float(value)
+                for value in detected_center
+            ),
+            axis_direction=tuple(
+                float(value)
+                for value in detected_direction
+            ),
+            confidence=float(
+                master_custom.get(
+                    "confidence",
+                    0.0,
+                )
+                or 0.0
+            ),
+            quality_score=float(
+                master_custom.get(
+                    "quality_score",
+                    0.0,
+                )
+                or 0.0
+            ),
+            quality_grade=str(
+                master_custom.get(
+                    "quality_grade",
+                    "Não avaliada",
+                )
+            ),
+            quality_stars=int(
+                master_custom.get(
+                    "quality_stars",
+                    0,
+                )
+                or 0
+            ),
+            circularity=float(
+                master_custom.get(
+                    "circularity",
+                    0.0,
+                )
+                or 0.0
+            ),
+            mean_absolute_error=float(
+                master_custom.get(
+                    "mean_absolute_error",
+                    0.0,
+                )
+                or 0.0
+            ),
+            standard_deviation=float(
+                master_custom.get(
+                    "standard_deviation",
+                    0.0,
+                )
+                or 0.0
+            ),
+            relative_rms_percent=float(
+                master_custom.get(
+                    "relative_rms_percent",
+                    0.0,
+                )
+                or 0.0
+            ),
+            inlier_ratio=float(
+                master_custom.get(
+                    "inlier_ratio",
+                    0.0,
+                )
+                or 0.0
+            ),
+            quality_reasons=tuple(
+                master_custom.get(
+                    "quality_reasons",
+                    (),
+                )
+                or ()
+            ),
+            parent=self,
+        )
+
+        pattern_settings = (
+            master_custom.get(
+                "pattern_settings",
+                None,
+            )
+        )
+
+        dialog.load_existing_values(
+            nominal_diameter=float(
+                entity.diameter
+            ),
+            nominal_center=tuple(
+                entity.center
+            ),
+            nominal_direction=tuple(
+                entity.axis_direction
+            ),
+            length_mode=stored_length_mode,
+            extension_factor=stored_extension_factor,
+            property_state=str(
+                master_custom.get(
+                    "property_state",
+                    CylinderPreviewDialog.STATE_RECOGNIZED,
+                )
+            ),
+            properties_locked=bool(
+                master_custom.get(
+                    "properties_locked",
+                    False,
+                )
+            ),
+            pattern_settings=(
+                dict(pattern_settings)
+                if isinstance(
+                    pattern_settings,
+                    dict,
+                )
+                else None
+            ),
+        )
+
+        pattern_id = master_custom.get(
+            "pattern_id",
+            None,
+        )
+
+        self._editing_object_ids = (
+            self._objects_in_pattern(
+                str(pattern_id)
+                if pattern_id
+                else None,
+                master_id,
+            )
+        )
+
+        fit_result = SimpleNamespace(
+            rms_error=float(
+                getattr(
+                    master_metadata,
+                    "rms_error",
+                    0.0,
+                )
+                or 0.0
+            ),
+            maximum_error=float(
+                master_custom.get(
+                    "maximum_error",
+                    0.0,
+                )
+                or 0.0
+            ),
+            point_count=int(
+                master_custom.get(
+                    "point_count",
+                    0,
+                )
+                or 0
+            ),
+            coverage_angle=float(
+                master_custom.get(
+                    "coverage_angle",
+                    0.0,
+                )
+                or 0.0
+            ),
+            radial_tolerance=float(
+                master_custom.get(
+                    "radial_tolerance",
+                    0.0,
+                )
+                or 0.0
+            ),
+        )
+
+        region_result = SimpleNamespace(
+            triangle_count=int(
+                master_custom.get(
+                    "triangle_count",
+                    0,
+                )
+                or 0
+            ),
+            cell_ids=tuple(
+                master_custom.get(
+                    "source_cell_ids",
+                    (),
+                )
+                or ()
+            ),
+        )
+
+        base_cylinder_entity = CylinderReference(
+            center=tuple(entity.center),
+            axis_direction=tuple(
+                entity.axis_direction
+            ),
+            radius=float(entity.radius),
+            length=recognized_length,
+            rms_error=float(entity.rms_error),
+            coverage_angle=float(
+                entity.coverage_angle
+            ),
+            source_object_id=(
+                entity.source_object_id
+            ),
+        )
+
+        self._pending_cylinder_creation = {
+            "source_object": source_object,
+            "region_result": region_result,
+            "fit_result": fit_result,
+            "cylinder_entity": base_cylinder_entity,
+            "axis_entity": base_cylinder_entity.create_axis(
+                display_extension=0.65
+            ),
+            "center_entity": (
+                base_cylinder_entity.create_center_point()
+            ),
+            "confidence": float(
+                master_custom.get(
+                    "confidence",
+                    0.0,
+                )
+                or 0.0
+            ),
+            "quality": CylinderQualityResult(
+                score=float(
+                    master_custom.get(
+                        "quality_score",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                grade=str(
+                    master_custom.get(
+                        "quality_grade",
+                        "Não avaliada",
+                    )
+                ),
+                stars=int(
+                    master_custom.get(
+                        "quality_stars",
+                        0,
+                    )
+                    or 0
+                ),
+                circularity=float(
+                    master_custom.get(
+                        "circularity",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                mean_absolute_error=float(
+                    master_custom.get(
+                        "mean_absolute_error",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                standard_deviation=float(
+                    master_custom.get(
+                        "standard_deviation",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                relative_rms_percent=float(
+                    master_custom.get(
+                        "relative_rms_percent",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                inlier_ratio=float(
+                    master_custom.get(
+                        "inlier_ratio",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                evaluated_point_count=int(
+                    master_custom.get(
+                        "evaluated_point_count",
+                        0,
+                    )
+                    or 0
+                ),
+                reasons=tuple(
+                    master_custom.get(
+                        "quality_reasons",
+                        (),
+                    )
+                    or ()
+                ),
+            ),
+        }
+
+        preview_length = recognized_length
+
+        if (
+            stored_length_mode
+            == CylinderPreviewDialog.LENGTH_EXTENDED
+        ):
+            preview_length *= stored_extension_factor
+
+        preview_entity = CylinderReference(
+            center=tuple(entity.center),
+            axis_direction=tuple(
+                entity.axis_direction
+            ),
+            radius=float(entity.radius),
+            length=preview_length,
+            rms_error=float(entity.rms_error),
+            coverage_angle=float(
+                entity.coverage_angle
+            ),
+            source_object_id=(
+                entity.source_object_id
+            ),
+        )
+
+        self._show_cylinder_preview(
+            region_geometry=None,
+            cylinder_entity=preview_entity,
+            axis_entity=preview_entity.create_axis(
+                display_extension=0.65
+            ),
+        )
+
+        self._cylinder_preview_dialog = dialog
+
+        dialog.geometry_changed.connect(
+            self.update_cylinder_geometry_preview
+        )
+        dialog.accepted.connect(
+            self.confirm_cylinder_preview
+        )
+        dialog.rejected.connect(
+            self.cancel_cylinder_preview
+        )
+        dialog.finished.connect(
+            self._release_cylinder_preview_dialog
+        )
+
+        dialog.setWindowTitle(
+            f"Editar {getattr(master_project_object, 'name', 'Cilindro')}"
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        self.statusBar().showMessage(
+            "Editando cilindro existente — confirme para atualizar"
+        )
+
+
     def start_cylinder_region_mode(self) -> None:
-        """Ativa o reconhecimento de cilindro por região."""
+        """Abre o painel interativo sem bloquear a viewport."""
 
         if not self.scene.objects_by_type("mesh"):
             QMessageBox.information(
@@ -1442,15 +2987,82 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dialog = CylinderRegionDialog(
-            default_radius=max(
-                self._reference_scale() * 0.08,
-                2.0,
-            ),
-            parent=self,
+        if (
+            self._cylinder_region_dialog is not None
+            and self._cylinder_region_dialog.isVisible()
+        ):
+            self._cylinder_region_dialog.raise_()
+            self._cylinder_region_dialog.activateWindow()
+            return
+
+        default_radius = max(
+            self._reference_scale() * 0.08,
+            2.0,
+        )
+        cylinder_preset = self.command_presets.load(
+            "recognize_cylinder_region",
+            {
+                "region_radius": default_radius,
+                "maximum_neighbor_angle": 20.0,
+                "minimum_points": 100,
+                "seed_count": 2,
+                "auto_recalculate": True,
+                "production_mode": False,
+                "multi_recognition": False,
+            },
         )
 
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog = CylinderRegionDialog(
+            default_radius=default_radius,
+            preset=cylinder_preset,
+            parent=self,
+        )
+        self._cylinder_region_dialog = dialog
+
+        dialog.selection_requested.connect(
+            self.begin_cylinder_seed_selection
+        )
+        dialog.clear_requested.connect(
+            self.clear_cylinder_seeds
+        )
+        dialog.recalculate_requested.connect(
+            self.recalculate_cylinder_from_seeds
+        )
+        dialog.automatic_recalculate_requested.connect(
+            self.recalculate_cylinder_from_seeds
+        )
+        dialog.history_result_requested.connect(
+            self.use_cylinder_recognition_history
+        )
+        dialog.add_to_batch_requested.connect(
+            self.add_pending_cylinder_to_batch
+        )
+        dialog.create_batch_requested.connect(
+            self.create_cylinder_batch
+        )
+        dialog.continue_requested.connect(
+            self.open_pending_cylinder_properties
+        )
+        dialog.cancel_requested.connect(
+            self.cancel_cylinder_region_mode
+        )
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        self.statusBar().showMessage(
+            "Painel de reconhecimento aberto"
+        )
+
+    def begin_cylinder_seed_selection(
+        self,
+    ) -> None:
+        """Lê os parâmetros atuais e habilita cliques na malha."""
+
+        dialog = self._cylinder_region_dialog
+
+        if dialog is None:
             return
 
         self._pending_cylinder_radius = (
@@ -1462,6 +3074,26 @@ class MainWindow(QMainWindow):
         self._pending_cylinder_minimum_points = (
             dialog.minimum_points()
         )
+        self._pending_cylinder_seed_count = (
+            dialog.seed_count()
+        )
+        self._cylinder_production_mode = (
+            dialog.production_mode_enabled()
+        )
+
+        self.command_presets.save(
+            "recognize_cylinder_region",
+            dialog.preset_values(),
+        )
+
+        self._pending_cylinder_seed_points = []
+        self._pending_cylinder_source_object_id = None
+        self._cylinder_recognition_history = []
+        dialog.clear_history_results()
+
+        if not dialog.multi_recognition_enabled():
+            self._cylinder_batch_queue = []
+            dialog.clear_batch_results()
 
         if self.delete_mode_active:
             self.cancel_delete_mode()
@@ -1485,10 +3117,73 @@ class MainWindow(QMainWindow):
             picker="cell",
         )
 
-        self.statusBar().showMessage(
-            "Clique no centro aproximado da região cilíndrica"
+        dialog.set_selection_active(True)
+        dialog.set_seed_progress(
+            0,
+            self._pending_cylinder_seed_count,
         )
 
+        self.statusBar().showMessage(
+            "Seleção de sementes ativa"
+        )
+
+    def clear_cylinder_seeds(self) -> None:
+        """Limpa cliques atuais sem fechar o painel."""
+
+        self._pending_cylinder_seed_points = []
+        self._pending_cylinder_source_object_id = None
+        self._pending_cylinder_creation = None
+        self._cylinder_recognition_history = []
+        self._clear_cylinder_preview()
+
+        dialog = self._cylinder_region_dialog
+
+        if dialog is not None:
+            dialog.set_selection_active(False)
+            dialog.set_seed_progress(
+                0,
+                dialog.seed_count(),
+                "Sementes removidas. Clique em Selecionar sementes.",
+            )
+            dialog.clear_result()
+            dialog.clear_history_results()
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        self.statusBar().showMessage(
+            "Sementes do cilindro removidas"
+        )
+
+    def cancel_cylinder_region_mode(self) -> None:
+        """Cancela a seleção interativa e fecha o painel."""
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        self._pending_cylinder_seed_points = []
+        self._pending_cylinder_source_object_id = None
+        self._pending_cylinder_creation = None
+        self._cylinder_recognition_history = []
+        self._cylinder_production_mode = False
+        self._cylinder_batch_queue = []
+        self._clear_cylinder_preview()
+
+        dialog = self._cylinder_region_dialog
+        self._cylinder_region_dialog = None
+
+        if dialog is not None:
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
+
+        self.statusBar().showMessage(
+            "Reconhecimento cilíndrico cancelado"
+        )
 
     def _cylinder_confidence(
         self,
@@ -1511,11 +3206,13 @@ class MainWindow(QMainWindow):
             + point_score * 0.15
         ) * 100.0
 
+
+
     def on_cylinder_region_picked(
         self,
         point: Any,
     ) -> None:
-        """Expande, refina e abre uma prévia navegável."""
+        """Coleta sementes sem fechar o painel."""
 
         if point is None or len(point) < 3:
             return
@@ -1525,12 +3222,6 @@ class MainWindow(QMainWindow):
             float(point[1]),
             float(point[2]),
         )
-
-        try:
-            self.viewer.disable_picking()
-        except Exception:
-            pass
-
         source_object = self._nearest_mesh_object(
             picked_point
         )
@@ -1543,32 +3234,157 @@ class MainWindow(QMainWindow):
             )
             return
 
-        try:
-            candidate_region, candidate_normals = (
-                grow_cylindrical_region(
-                    mesh=source_object.data,
-                    seed_point=picked_point,
-                    radius=self._pending_cylinder_radius,
-                    maximum_neighbor_angle_degrees=(
-                        self._pending_cylinder_angle
-                    ),
+        if (
+            self._pending_cylinder_source_object_id
+            is not None
+            and source_object.object_id
+            != self._pending_cylinder_source_object_id
+        ):
+            QMessageBox.warning(
+                self,
+                "Malhas diferentes",
+                (
+                    "As sementes devem pertencer à mesma malha. "
+                    "Clique na malha da primeira semente."
+                ),
+            )
+            return
+
+        self._pending_cylinder_source_object_id = (
+            source_object.object_id
+        )
+        self._pending_cylinder_seed_points.append(
+            picked_point
+        )
+
+        dialog = self._cylinder_region_dialog
+        collected = len(
+            self._pending_cylinder_seed_points
+        )
+        required = int(
+            self._pending_cylinder_seed_count
+        )
+
+        if dialog is not None:
+            dialog.set_seed_progress(
+                collected,
+                required,
+            )
+
+        if collected < required:
+            self.statusBar().showMessage(
+                (
+                    f"Semente {collected}/{required} registrada. "
+                    "Clique novamente na parede cilíndrica."
                 )
+            )
+            return
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        self.recalculate_cylinder_from_seeds()
+
+    def recalculate_cylinder_from_seeds(
+        self,
+    ) -> None:
+        """Reutiliza as mesmas sementes com os parâmetros atuais."""
+
+        dialog = self._cylinder_region_dialog
+
+        if dialog is None:
+            return
+
+        required = int(
+            dialog.seed_count()
+        )
+
+        if (
+            len(self._pending_cylinder_seed_points)
+            < required
+        ):
+            dialog.set_error(
+                "Selecione todas as sementes antes de recalcular."
+            )
+            return
+
+        source_object = self.scene.get_object(
+            self._pending_cylinder_source_object_id
+        )
+
+        if source_object is None:
+            dialog.set_error(
+                "A malha das sementes não está mais disponível."
+            )
+            return
+
+        self._pending_cylinder_radius = (
+            dialog.region_radius()
+        )
+        self._pending_cylinder_angle = (
+            dialog.maximum_neighbor_angle()
+        )
+        self._pending_cylinder_minimum_points = (
+            dialog.minimum_points()
+        )
+        self._pending_cylinder_seed_count = required
+
+        self.command_presets.save(
+            "recognize_cylinder_region",
+            dialog.preset_values(),
+        )
+
+        dialog.set_calculation_in_progress(
+            True
+        )
+        dialog.set_seed_progress(
+            required,
+            required,
+            "Recalculando com as sementes atuais...",
+        )
+
+        try:
+            seed_regions = []
+
+            for seed_point in (
+                self._pending_cylinder_seed_points[:required]
+            ):
+                seed_regions.append(
+                    grow_cylindrical_region(
+                        mesh=source_object.data,
+                        seed_point=seed_point,
+                        radius=(
+                            self._pending_cylinder_radius
+                        ),
+                        maximum_neighbor_angle_degrees=(
+                            self._pending_cylinder_angle
+                        ),
+                    )
+                )
+
+            (
+                candidate_cell_ids,
+                candidate_points,
+                candidate_normals,
+                seed_cell_ids,
+            ) = merge_cylindrical_seed_regions(
+                seed_regions
             )
 
             preliminary_fit = fit_cylinder_to_points(
-                candidate_region.points,
+                candidate_points,
                 candidate_normals,
             )
 
             refined_region, refined_normals = (
-                refine_cylindrical_cells(
+                refine_cylindrical_cells_multi_seed(
                     mesh=source_object.data,
                     candidate_cell_ids=(
-                        candidate_region.cell_ids
+                        candidate_cell_ids
                     ),
-                    seed_cell_id=(
-                        candidate_region.seed_cell_id
-                    ),
+                    seed_cell_ids=seed_cell_ids,
                     cylinder_center=(
                         preliminary_fit.center
                     ),
@@ -1589,78 +3405,99 @@ class MainWindow(QMainWindow):
                 refined_normals,
             )
 
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Erro no reconhecimento do cilindro",
-                str(error),
-            )
-            return
+            if (
+                refined_region.point_count
+                < self._pending_cylinder_minimum_points
+            ):
+                raise ValueError(
+                    (
+                        f"A região possui "
+                        f"{refined_region.point_count} pontos; "
+                        f"o mínimo é "
+                        f"{self._pending_cylinder_minimum_points}."
+                    )
+                )
 
-        if (
-            refined_region.point_count
-            < self._pending_cylinder_minimum_points
-        ):
-            QMessageBox.warning(
-                self,
-                "Poucos pontos após o refinamento",
-                (
-                    f"A região final possui "
-                    f"{refined_region.point_count} pontos, "
-                    "mas o mínimo configurado é "
-                    f"{self._pending_cylinder_minimum_points}.\n\n"
-                    "Aumente o raio da expansão ou reduza "
-                    "o mínimo de pontos."
+            cylinder_entity = CylinderReference(
+                center=fit_result.center,
+                axis_direction=(
+                    fit_result.axis_direction
+                ),
+                radius=fit_result.radius,
+                length=fit_result.length,
+                rms_error=fit_result.rms_error,
+                coverage_angle=(
+                    fit_result.coverage_angle
+                ),
+                source_object_id=(
+                    source_object.object_id
                 ),
             )
-            return
 
-        cylinder_entity = CylinderReference(
-            center=fit_result.center,
-            axis_direction=(
-                fit_result.axis_direction
-            ),
-            radius=fit_result.radius,
-            length=fit_result.length,
-            rms_error=fit_result.rms_error,
-            coverage_angle=(
-                fit_result.coverage_angle
-            ),
-            source_object_id=(
-                source_object.object_id
-            ),
-        )
+            axis_entity = cylinder_entity.create_axis(
+                display_extension=0.65
+            )
+            center_entity = (
+                cylinder_entity.create_center_point()
+            )
 
-        axis_entity = cylinder_entity.create_axis(
-            display_extension=0.20
-        )
-
-        center_entity = (
-            cylinder_entity.create_center_point()
-        )
-
-        region_geometry = (
-            source_object.data.extract_cells(
-                list(
-                    refined_region.cell_ids
+            region_geometry = (
+                source_object.data.extract_cells(
+                    list(
+                        refined_region.cell_ids
+                    )
                 )
             )
-        )
 
-        self._show_cylinder_preview(
-            region_geometry=region_geometry,
-            cylinder_entity=cylinder_entity,
-            axis_entity=axis_entity,
-        )
+            self._show_cylinder_preview(
+                region_geometry=region_geometry,
+                cylinder_entity=cylinder_entity,
+                axis_entity=axis_entity,
+            )
 
-        confidence = self._cylinder_confidence(
-            radius=cylinder_entity.radius,
-            rms_error=fit_result.rms_error,
-            coverage_angle=fit_result.coverage_angle,
-            point_count=fit_result.point_count,
-        )
+            confidence = self._cylinder_confidence(
+                radius=cylinder_entity.radius,
+                rms_error=fit_result.rms_error,
+                coverage_angle=(
+                    fit_result.coverage_angle
+                ),
+                point_count=fit_result.point_count,
+            )
 
-        self._pending_cylinder_creation = {
+            quality = evaluate_cylinder_quality(
+                points=refined_region.points,
+                center=fit_result.center,
+                axis_direction=(
+                    fit_result.axis_direction
+                ),
+                radius=fit_result.radius,
+                rms_error=fit_result.rms_error,
+                maximum_error=(
+                    fit_result.maximum_error
+                ),
+                coverage_angle=(
+                    fit_result.coverage_angle
+                ),
+                radial_tolerance=(
+                    fit_result.radial_tolerance
+                ),
+            )
+
+        except Exception as error:
+            self._pending_cylinder_creation = None
+            self._clear_cylinder_preview()
+            dialog.set_calculation_in_progress(
+                False
+            )
+            dialog.set_error(
+                str(error)
+            )
+            self.statusBar().showMessage(
+                "O reconhecimento precisa ser ajustado"
+            )
+            return
+
+        snapshot = {
             "source_object": source_object,
             "region_result": refined_region,
             "fit_result": fit_result,
@@ -1668,7 +3505,589 @@ class MainWindow(QMainWindow):
             "axis_entity": axis_entity,
             "center_entity": center_entity,
             "confidence": confidence,
+            "quality": quality,
+            "seed_points": tuple(
+                self._pending_cylinder_seed_points[:required]
+            ),
+            "seed_count": required,
+            "region_geometry": region_geometry,
+            "region_radius": float(
+                self._pending_cylinder_radius
+            ),
+            "neighbor_angle": float(
+                self._pending_cylinder_angle
+            ),
+            "minimum_points": int(
+                self._pending_cylinder_minimum_points
+            ),
+            "production_mode": bool(
+                self._cylinder_production_mode
+            ),
         }
+
+        self._cylinder_recognition_history.append(
+            snapshot
+        )
+
+        best_index = max(
+            range(
+                len(
+                    self._cylinder_recognition_history
+                )
+            ),
+            key=lambda index: (
+                self._cylinder_recognition_history[
+                    index
+                ]["quality"].score,
+                -self._cylinder_recognition_history[
+                    index
+                ]["fit_result"].rms_error,
+                self._cylinder_recognition_history[
+                    index
+                ]["fit_result"].coverage_angle,
+            ),
+        )
+
+        current_index = (
+            len(
+                self._cylinder_recognition_history
+            )
+            - 1
+        )
+        self._pending_cylinder_creation = snapshot
+
+        dialog.set_calculation_in_progress(
+            False
+        )
+        dialog.set_result(
+            diameter=cylinder_entity.diameter,
+            rms_error=fit_result.rms_error,
+            coverage_angle=(
+                fit_result.coverage_angle
+            ),
+            quality_grade=quality.grade,
+            quality_score=quality.score,
+            point_count=fit_result.point_count,
+        )
+        dialog.add_history_result(
+            attempt_number=current_index + 1,
+            diameter=cylinder_entity.diameter,
+            rms_error=fit_result.rms_error,
+            coverage_angle=(
+                fit_result.coverage_angle
+            ),
+            quality_grade=quality.grade,
+            quality_score=quality.score,
+            region_radius=float(
+                self._pending_cylinder_radius
+            ),
+            neighbor_angle=float(
+                self._pending_cylinder_angle
+            ),
+            is_best=current_index == best_index,
+        )
+        dialog.mark_best_history_result(
+            best_index
+        )
+
+        self.statusBar().showMessage(
+            (
+                f"Resultado recalculado | "
+                f"Ø {cylinder_entity.diameter:.4f} mm | "
+                f"{quality.grade} {quality.score:.1f}%"
+            )
+        )
+
+
+    def use_cylinder_recognition_history(
+        self,
+        index: int,
+    ) -> None:
+        """Recupera uma tentativa anterior da sessão."""
+
+        if (
+            index < 0
+            or index
+            >= len(
+                self._cylinder_recognition_history
+            )
+        ):
+            return
+
+        snapshot = (
+            self._cylinder_recognition_history[
+                index
+            ]
+        )
+        self._pending_cylinder_creation = snapshot
+
+        self._show_cylinder_preview(
+            region_geometry=(
+                snapshot["region_geometry"]
+            ),
+            cylinder_entity=(
+                snapshot["cylinder_entity"]
+            ),
+            axis_entity=snapshot["axis_entity"],
+        )
+
+        dialog = self._cylinder_region_dialog
+
+        if dialog is not None:
+            fit_result = snapshot["fit_result"]
+            quality = snapshot["quality"]
+            cylinder = snapshot[
+                "cylinder_entity"
+            ]
+
+            dialog.set_result(
+                diameter=cylinder.diameter,
+                rms_error=fit_result.rms_error,
+                coverage_angle=(
+                    fit_result.coverage_angle
+                ),
+                quality_grade=quality.grade,
+                quality_score=quality.score,
+                point_count=fit_result.point_count,
+            )
+            dialog.select_history_result(index)
+            dialog.progress_label.setText(
+                (
+                    f"Resultado {index + 1} recuperado.\\n"
+                    "Você pode abrir as propriedades ou "
+                    "continuar comparando."
+                )
+            )
+
+        self.statusBar().showMessage(
+            (
+                f"Resultado {index + 1} recuperado | "
+                f"Ø "
+                f"{snapshot['cylinder_entity'].diameter:.4f} mm | "
+                f"{snapshot['quality'].grade} "
+                f"{snapshot['quality'].score:.1f}%"
+            )
+        )
+
+
+    def add_pending_cylinder_to_batch(
+        self,
+    ) -> None:
+        """Adiciona o resultado ativo ao lote e prepara nova seleção."""
+
+        pending = self._pending_cylinder_creation
+        dialog = self._cylinder_region_dialog
+
+        if pending is None or dialog is None:
+            QMessageBox.information(
+                self,
+                "Resultado inexistente",
+                "Reconheça um cilindro válido antes de adicionar ao lote.",
+            )
+            return
+
+        snapshot = dict(pending)
+        self._cylinder_batch_queue.append(
+            snapshot
+        )
+
+        cylinder = snapshot["cylinder_entity"]
+        quality = snapshot["quality"]
+
+        dialog.add_batch_result(
+            index=len(self._cylinder_batch_queue),
+            diameter=cylinder.diameter,
+            quality_grade=quality.grade,
+            quality_score=quality.score,
+        )
+
+        self._pending_cylinder_creation = None
+        self._pending_cylinder_seed_points = []
+        self._pending_cylinder_source_object_id = None
+        self._cylinder_recognition_history = []
+        dialog.clear_history_results()
+        self._clear_cylinder_preview()
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        dialog.set_selection_active(False)
+        dialog.set_seed_progress(
+            0,
+            dialog.seed_count(),
+            (
+                f"{len(self._cylinder_batch_queue)} cilindro(s) no lote. "
+                "Clique em Selecionar sementes para o próximo."
+            ),
+        )
+
+        self.statusBar().showMessage(
+            (
+                f"Cilindro adicionado ao lote | "
+                f"Total: {len(self._cylinder_batch_queue)}"
+            )
+        )
+
+    def create_cylinder_batch(
+        self,
+    ) -> None:
+        """Cria todos os cilindros acumulados em uma única operação."""
+
+        dialog = self._cylinder_region_dialog
+
+        if not self._cylinder_batch_queue:
+            QMessageBox.information(
+                self,
+                "Lote vazio",
+                "Adicione ao menos um cilindro ao lote.",
+            )
+            return
+
+        creation_preset = self.command_presets.load(
+            "create_cylinder_reference",
+            {},
+        )
+
+        length_mode = str(
+            creation_preset.get(
+                "length_mode",
+                CylinderPreviewDialog.LENGTH_REGION,
+            )
+        )
+        extension_factor = max(
+            1.0,
+            float(
+                creation_preset.get(
+                    "extension_factor",
+                    3.0,
+                )
+            ),
+        )
+        create_axis = bool(
+            creation_preset.get(
+                "create_axis",
+                True,
+            )
+        )
+        create_center = bool(
+            creation_preset.get(
+                "create_center",
+                True,
+            )
+        )
+
+        commands = []
+
+        for batch_index, snapshot in enumerate(
+            self._cylinder_batch_queue,
+            start=1,
+        ):
+            source_object = snapshot[
+                "source_object"
+            ]
+            region_result = snapshot[
+                "region_result"
+            ]
+            fit_result = snapshot[
+                "fit_result"
+            ]
+            base_entity = snapshot[
+                "cylinder_entity"
+            ]
+            quality = snapshot["quality"]
+
+            final_length = float(
+                base_entity.length
+            )
+
+            if (
+                length_mode
+                == CylinderPreviewDialog.LENGTH_EXTENDED
+            ):
+                final_length *= extension_factor
+
+            entity = CylinderReference(
+                center=tuple(base_entity.center),
+                axis_direction=tuple(
+                    base_entity.axis_direction
+                ),
+                radius=float(base_entity.radius),
+                length=final_length,
+                rms_error=float(
+                    base_entity.rms_error
+                ),
+                coverage_angle=float(
+                    base_entity.coverage_angle
+                ),
+                source_object_id=(
+                    base_entity.source_object_id
+                ),
+            )
+
+            record = self.references.create_record(
+                entity,
+                name=f"Cilindro Lote {batch_index:02d}",
+            )
+
+            commands.append(
+                CreateReferenceCommand(
+                    scene=self.scene,
+                    project_panel=self.project_panel,
+                    project_manager=self.project,
+                    reference_manager=self.references,
+                    record=record,
+                    display_geometry=(
+                        create_cylinder_reference_lines(
+                            entity
+                        )
+                    ),
+                    render_options={
+                        "color": "#70e000",
+                        "opacity": 0.82,
+                        "line_width": 2.0,
+                        "lighting": False,
+                        "ambient": 1.0,
+                        "pickable": True,
+                    },
+                    metadata=ProjectObjectMetadata(
+                        source_object_id=(
+                            source_object.object_id
+                        ),
+                        created_by="multi_recognition",
+                        creation_method=(
+                            "cylinder_multi_recognition"
+                        ),
+                        rms_error=(
+                            fit_result.rms_error
+                        ),
+                        custom={
+                            "batch_index": batch_index,
+                            "batch_size": len(
+                                self._cylinder_batch_queue
+                            ),
+                            "maximum_error": (
+                                fit_result.maximum_error
+                            ),
+                            "point_count": (
+                                fit_result.point_count
+                            ),
+                            "triangle_count": (
+                                region_result.triangle_count
+                            ),
+                            "coverage_angle": (
+                                fit_result.coverage_angle
+                            ),
+                            "quality_score": (
+                                quality.score
+                            ),
+                            "quality_grade": (
+                                quality.grade
+                            ),
+                            "quality_stars": (
+                                quality.stars
+                            ),
+                            "circularity": (
+                                quality.circularity
+                            ),
+                            "recognized_length": (
+                                float(
+                                    base_entity.length
+                                )
+                            ),
+                            "display_length": (
+                                float(final_length)
+                            ),
+                            "length_mode": length_mode,
+                            "extension_factor": (
+                                extension_factor
+                                if length_mode
+                                == CylinderPreviewDialog.LENGTH_EXTENDED
+                                else 1.0
+                            ),
+                            "recognition_seed_count": (
+                                int(
+                                    snapshot.get(
+                                        "seed_count",
+                                        1,
+                                    )
+                                )
+                            ),
+                            "recognition_seed_points": [
+                                tuple(point)
+                                for point in snapshot.get(
+                                    "seed_points",
+                                    (),
+                                )
+                            ],
+                            "source_cell_ids": list(
+                                region_result.cell_ids
+                            ),
+                        },
+                    ),
+                )
+            )
+
+            if create_axis:
+                axis_entity = entity.create_axis(
+                    display_extension=0.65
+                )
+                axis_record = self.references.create_record(
+                    axis_entity,
+                    name=f"Eixo de {record.name}",
+                )
+                commands.append(
+                    CreateReferenceCommand(
+                        scene=self.scene,
+                        project_panel=self.project_panel,
+                        project_manager=self.project,
+                        reference_manager=self.references,
+                        record=axis_record,
+                        display_geometry=(
+                            self.reference_factory.create_axis(
+                                axis_entity
+                            )
+                        ),
+                        render_options={
+                            "color": "#4ea1ff",
+                            "lighting": False,
+                            "ambient": 1.0,
+                            "pickable": True,
+                        },
+                        metadata=ProjectObjectMetadata(
+                            source_object_id=(
+                                record.object_id
+                            ),
+                            created_by="multi_recognition",
+                            creation_method=(
+                                "axis_from_batch_cylinder"
+                            ),
+                        ),
+                    )
+                )
+
+            if create_center:
+                center_entity = (
+                    entity.create_center_point()
+                )
+                center_record = (
+                    self.references.create_record(
+                        center_entity,
+                        name=f"Centro de {record.name}",
+                    )
+                )
+                commands.append(
+                    CreateReferenceCommand(
+                        scene=self.scene,
+                        project_panel=self.project_panel,
+                        project_manager=self.project,
+                        reference_manager=self.references,
+                        record=center_record,
+                        display_geometry=(
+                            self.reference_factory.create_point(
+                                center_entity,
+                                radius=max(
+                                    self._reference_scale()
+                                    * 0.0035,
+                                    0.25,
+                                ),
+                            )
+                        ),
+                        render_options={
+                            "color": "#ff7a45",
+                            "smooth_shading": True,
+                            "ambient": 0.7,
+                            "diffuse": 0.3,
+                            "pickable": True,
+                        },
+                        metadata=ProjectObjectMetadata(
+                            source_object_id=(
+                                record.object_id
+                            ),
+                            created_by="multi_recognition",
+                            creation_method=(
+                                "center_from_batch_cylinder"
+                            ),
+                        ),
+                    )
+                )
+
+        batch_command = CreateReferenceBatchCommand(
+            description=(
+                f"Criar lote com "
+                f"{len(self._cylinder_batch_queue)} cilindros"
+            ),
+            commands=commands,
+        )
+
+        self.history.execute(
+            batch_command
+        )
+        created_count = len(
+            self._cylinder_batch_queue
+        )
+        self._cylinder_batch_queue = []
+        self.viewer.render()
+
+        if dialog is not None:
+            dialog.clear_batch_results()
+            dialog.set_seed_progress(
+                0,
+                dialog.seed_count(),
+                (
+                    f"Lote com {created_count} cilindros criado. "
+                    "Você pode iniciar outro lote ou cancelar."
+                ),
+            )
+
+        self.statusBar().showMessage(
+            (
+                f"Lote criado: {created_count} cilindros | "
+                "Ctrl+Z desfaz todo o lote"
+            )
+        )
+
+    def open_pending_cylinder_properties(
+        self,
+    ) -> None:
+        """Aceita o resultado atual e abre as propriedades nominais."""
+
+        pending = self._pending_cylinder_creation
+
+        if pending is None:
+            QMessageBox.information(
+                self,
+                "Resultado inexistente",
+                "Calcule um cilindro válido antes de continuar.",
+            )
+            return
+
+        source_object = pending["source_object"]
+        refined_region = pending["region_result"]
+        fit_result = pending["fit_result"]
+        cylinder_entity = pending["cylinder_entity"]
+        confidence = pending["confidence"]
+        quality = pending["quality"]
+        self._cylinder_production_mode = bool(
+            pending.get(
+                "production_mode",
+                self._cylinder_production_mode,
+            )
+        )
+
+        try:
+            self.viewer.disable_picking()
+        except Exception:
+            pass
+
+        region_dialog = self._cylinder_region_dialog
+        self._cylinder_region_dialog = None
+
+        if region_dialog is not None:
+            region_dialog.blockSignals(True)
+            region_dialog.close()
+            region_dialog.deleteLater()
 
         dialog = CylinderPreviewDialog(
             triangle_count=(
@@ -1686,18 +4105,60 @@ class MainWindow(QMainWindow):
             coverage_angle=(
                 fit_result.coverage_angle
             ),
+            center=cylinder_entity.center,
             axis_direction=(
                 fit_result.axis_direction
             ),
             confidence=confidence,
+            quality_score=quality.score,
+            quality_grade=quality.grade,
+            quality_stars=quality.stars,
+            circularity=quality.circularity,
+            mean_absolute_error=(
+                quality.mean_absolute_error
+            ),
+            standard_deviation=(
+                quality.standard_deviation
+            ),
+            relative_rms_percent=(
+                quality.relative_rms_percent
+            ),
+            inlier_ratio=quality.inlier_ratio,
+            quality_reasons=quality.reasons,
             parent=self,
         )
 
-        self._cylinder_preview_dialog = dialog
-
-        dialog.diameter_changed.connect(
-            self.update_cylinder_diameter_preview
+        dialog.apply_creation_preset(
+            self.command_presets.load(
+                "create_cylinder_reference",
+                {},
+            )
         )
+
+        self._cylinder_preview_dialog = dialog
+        dialog.geometry_changed.connect(
+            self.update_cylinder_geometry_preview
+        )
+
+        self.update_cylinder_geometry_preview(
+            {
+                "diameter": dialog.final_diameter(),
+                "center": dialog.final_center(),
+                "direction": dialog.final_direction(),
+                "length_mode": dialog.length_mode(),
+                "extension_factor": (
+                    dialog.extension_factor()
+                ),
+                "create_axis": dialog.create_axis(),
+                "create_center": (
+                    dialog.create_center_point()
+                ),
+                "pattern_settings": (
+                    dialog.pattern_settings()
+                ),
+            }
+        )
+
         dialog.accepted.connect(
             self.confirm_cylinder_preview
         )
@@ -1713,45 +4174,297 @@ class MainWindow(QMainWindow):
         dialog.activateWindow()
 
         self.statusBar().showMessage(
-            "Prévia cilíndrica ativa — use a viewport "
-            "para girar, mover e aplicar zoom"
+            "Resultado aceito — ajuste as propriedades nominais"
         )
 
+    def update_cylinder_geometry_preview(
+        self,
+        values: object,
+    ) -> None:
+        """Atualiza ao vivo o cilindro mestre e o padrão completo."""
 
-    def update_cylinder_diameter_preview(self, diameter: float) -> None:
-        """Atualiza ao vivo o diâmetro nominal da prévia."""
-        pending=self._pending_cylinder_creation
-        if pending is None or diameter<=0.0:
+        pending = self._pending_cylinder_creation
+
+        if pending is None or not isinstance(values, dict):
             return
-        original=pending["cylinder_entity"]
-        preview_entity=CylinderReference(
-            center=original.center,
-            axis_direction=original.axis_direction,
-            radius=diameter/2.0,
-            length=original.length,
-            rms_error=original.rms_error,
-            coverage_angle=original.coverage_angle,
-            source_object_id=original.source_object_id,
+
+        original = pending["cylinder_entity"]
+
+        diameter = float(
+            values.get("diameter", original.diameter)
         )
-        try:
-            self.viewer.remove_actor(self._cylinder_preview_name, render=False)
-        except Exception:
-            pass
-        actor=self.viewer.add_mesh(
-            self.reference_factory.create_cylinder(preview_entity),
-            name=self._cylinder_preview_name,
-            color="#70e000", opacity=0.30,
-            show_edges=True, edge_color="#b7ff8a",
-            line_width=1.5, lighting=False,
+        center = tuple(
+            float(value)
+            for value in values.get(
+                "center",
+                original.center,
+            )
         )
+        direction = tuple(
+            float(value)
+            for value in values.get(
+                "direction",
+                original.axis_direction,
+            )
+        )
+
+        if diameter <= 0.0:
+            return
+
+        length = float(original.length)
+        length_mode = str(
+            values.get(
+                "length_mode",
+                CylinderPreviewDialog.LENGTH_REGION,
+            )
+        )
+        extension_factor = max(
+            1.0,
+            float(
+                values.get(
+                    "extension_factor",
+                    1.0,
+                )
+            ),
+        )
+
+        if (
+            length_mode
+            == CylinderPreviewDialog.LENGTH_EXTENDED
+        ):
+            length *= extension_factor
+
+        create_axis = bool(
+            values.get("create_axis", True)
+        )
+        create_center = bool(
+            values.get("create_center", True)
+        )
+
+        settings = values.get(
+            "pattern_settings",
+            {},
+        )
+        if not isinstance(settings, dict):
+            settings = {}
+
+        pattern_type = str(
+            settings.get(
+                "type",
+                CylinderPreviewDialog.PATTERN_NONE,
+            )
+        )
+        quantity = max(
+            1,
+            int(settings.get("quantity", 1)),
+        )
+
         try:
-            actor.SetPickable(False)
-        except Exception:
-            pass
+            if (
+                pattern_type
+                == CylinderPreviewDialog.PATTERN_LINEAR
+            ):
+                instances = create_linear_pattern(
+                    master_center=center,
+                    master_direction=direction,
+                    translation_direction=tuple(
+                        settings.get(
+                            "axis_direction",
+                            (1.0, 0.0, 0.0),
+                        )
+                    ),
+                    spacing=float(
+                        settings.get(
+                            "spacing",
+                            100.0,
+                        )
+                    ),
+                    quantity=quantity,
+                )
+            elif (
+                pattern_type
+                == CylinderPreviewDialog.PATTERN_CIRCULAR
+            ):
+                instances = create_circular_pattern(
+                    master_center=center,
+                    master_direction=direction,
+                    axis_origin=tuple(
+                        settings.get(
+                            "axis_origin",
+                            (0.0, 0.0, 0.0),
+                        )
+                    ),
+                    axis_direction=tuple(
+                        settings.get(
+                            "axis_direction",
+                            (0.0, 0.0, 1.0),
+                        )
+                    ),
+                    angle_step_degrees=float(
+                        settings.get(
+                            "angle_step",
+                            30.0,
+                        )
+                    ),
+                    quantity=quantity,
+                    rotate_orientation=bool(
+                        settings.get(
+                            "rotate_orientation",
+                            False,
+                        )
+                    ),
+                )
+            else:
+                instances = [
+                    PatternInstance(
+                        index=0,
+                        center=center,
+                        direction=direction,
+                        parameter=0.0,
+                        is_master=True,
+                    )
+                ]
+        except Exception as error:
+            self.statusBar().showMessage(
+                f"Prévia inválida: {error}"
+            )
+            return
+
+        for actor_name in [
+            self._cylinder_preview_name,
+            self._cylinder_axis_preview_name,
+            self._cylinder_center_preview_name,
+            *self._cylinder_pattern_preview_names,
+        ]:
+            try:
+                self.viewer.remove_actor(
+                    actor_name,
+                    render=False,
+                )
+            except Exception:
+                pass
+
+        self._cylinder_pattern_preview_names = []
+        actors = []
+
+        for instance in instances:
+            entity = CylinderReference(
+                center=instance.center,
+                axis_direction=instance.direction,
+                radius=diameter / 2.0,
+                length=length,
+                rms_error=original.rms_error,
+                coverage_angle=(
+                    original.coverage_angle
+                ),
+                source_object_id=(
+                    original.source_object_id
+                ),
+            )
+
+            prefix = (
+                "__flcad_pattern_preview_"
+                f"{instance.index:03d}"
+            )
+
+            cylinder_name = f"{prefix}_cylinder"
+            self._cylinder_pattern_preview_names.append(
+                cylinder_name
+            )
+            actors.append(
+                self.viewer.add_mesh(
+                    create_cylinder_reference_lines(
+                        entity
+                    ),
+                    name=cylinder_name,
+                    color=(
+                        "#70e000"
+                        if instance.is_master
+                        else "#9be564"
+                    ),
+                    opacity=(
+                        0.95
+                        if instance.is_master
+                        else 0.68
+                    ),
+                    line_width=(
+                        2.4
+                        if instance.is_master
+                        else 1.6
+                    ),
+                    lighting=False,
+                    ambient=1.0,
+                )
+            )
+
+            if create_axis:
+                axis_name = f"{prefix}_axis"
+                self._cylinder_pattern_preview_names.append(
+                    axis_name
+                )
+                actors.append(
+                    self.viewer.add_mesh(
+                        self.reference_factory.create_axis(
+                            entity.create_axis(
+                                display_extension=0.65
+                            )
+                        ),
+                        name=axis_name,
+                        color="#4ea1ff",
+                        opacity=(
+                            1.0
+                            if instance.is_master
+                            else 0.58
+                        ),
+                        lighting=False,
+                        ambient=1.0,
+                    )
+                )
+
+            if create_center:
+                center_name = f"{prefix}_center"
+                self._cylinder_pattern_preview_names.append(
+                    center_name
+                )
+                actors.append(
+                    self.viewer.add_mesh(
+                        self.reference_factory.create_point(
+                            entity.create_center_point(),
+                            radius=max(
+                                self._reference_scale()
+                                * 0.0035,
+                                0.25,
+                            ),
+                        ),
+                        name=center_name,
+                        color="#ff7a45",
+                        opacity=(
+                            1.0
+                            if instance.is_master
+                            else 0.65
+                        ),
+                        smooth_shading=True,
+                        ambient=0.8,
+                        diffuse=0.2,
+                    )
+                )
+
+        for actor in actors:
+            try:
+                actor.SetPickable(False)
+            except Exception:
+                pass
+
         self.viewer.render()
+        self.statusBar().showMessage(
+            (
+                f"Prévia dinâmica: {len(instances)} cilindro(s) | "
+                f"Ø {diameter:.4f} mm"
+            )
+        )
 
     def confirm_cylinder_preview(self) -> None:
-        """Confirma a criação do cilindro e derivados."""
+        """Cria o cilindro mestre e suas instâncias opcionais."""
 
         pending = self._pending_cylinder_creation
         dialog = self._cylinder_preview_dialog
@@ -1760,139 +4473,163 @@ class MainWindow(QMainWindow):
             self._clear_cylinder_preview()
             return
 
-        source_object = pending[
-            "source_object"
-        ]
-        region_result = pending[
-            "region_result"
-        ]
-        fit_result = pending[
-            "fit_result"
-        ]
-        cylinder_entity = pending[
-            "cylinder_entity"
-        ]
-        axis_entity = pending[
-            "axis_entity"
-        ]
-        center_entity = pending[
-            "center_entity"
-        ]
+        source_object = pending["source_object"]
+        region_result = pending["region_result"]
+        fit_result = pending["fit_result"]
+        cylinder_entity = pending["cylinder_entity"]
 
         create_axis = dialog.create_axis()
-        create_center = (
-            dialog.create_center_point()
-        )
+        create_center = dialog.create_center_point()
         final_diameter = dialog.final_diameter()
         detected_diameter = dialog.detected_diameter()
+        final_center = dialog.final_center()
+        detected_center = dialog.detected_center()
+        final_direction = dialog.final_direction()
+        detected_direction = dialog.detected_direction()
+        property_state = dialog.property_state()
+        properties_locked = dialog.properties_locked()
         length_mode = dialog.length_mode()
         extension_factor = dialog.extension_factor()
+        pattern_settings = dialog.pattern_settings()
+
+        self.command_presets.save(
+            "create_cylinder_reference",
+            dialog.creation_preset_values(),
+        )
 
         self._clear_cylinder_preview()
 
         final_length = cylinder_entity.length
-        if length_mode == CylinderPreviewDialog.LENGTH_EXTENDED:
-            final_length = cylinder_entity.length * extension_factor
 
-        final_cylinder_entity = CylinderReference(
-            center=cylinder_entity.center,
-            axis_direction=cylinder_entity.axis_direction,
-            radius=final_diameter / 2.0,
-            length=final_length,
-            rms_error=cylinder_entity.rms_error,
-            coverage_angle=cylinder_entity.coverage_angle,
-            source_object_id=cylinder_entity.source_object_id,
-        )
-
-        final_axis_entity = final_cylinder_entity.create_axis(
-            display_extension=0.20
-        )
-
-        cylinder_record = (
-            self.references.create_record(
-                final_cylinder_entity
+        if (
+            length_mode
+            == CylinderPreviewDialog.LENGTH_EXTENDED
+        ):
+            final_length = (
+                cylinder_entity.length
+                * extension_factor
             )
+
+        pattern_type = str(
+            pattern_settings["type"]
+        )
+        quantity = int(
+            pattern_settings["quantity"]
         )
 
-        commands = [
-            CreateReferenceCommand(
-                scene=self.scene,
-                project_panel=self.project_panel,
-                project_manager=self.project,
-                reference_manager=self.references,
-                record=cylinder_record,
-                display_geometry=(
-                    self.reference_factory.create_cylinder(
-                        final_cylinder_entity
-                    )
+        if (
+            pattern_type
+            == CylinderPreviewDialog.PATTERN_LINEAR
+        ):
+            instances = create_linear_pattern(
+                master_center=final_center,
+                master_direction=final_direction,
+                translation_direction=(
+                    pattern_settings[
+                        "axis_direction"
+                    ]
                 ),
-                render_options={
-                    "color": "#70e000",
-                    "opacity": 0.30,
-                    "show_edges": True,
-                    "edge_color": "#b7ff8a",
-                    "line_width": 1.0,
-                    "lighting": False,
-                    "ambient": 1.0,
-                    "pickable": True,
-                },
-                metadata=ProjectObjectMetadata(
-                    source_object_id=(
-                        source_object.object_id
-                    ),
-                    created_by="user",
-                    creation_method=(
-                        "cylinder_fit_refined_region"
-                    ),
-                    rms_error=fit_result.rms_error,
-                    custom={
-                        "maximum_error": (
-                            fit_result.maximum_error
-                        ),
-                        "point_count": (
-                            fit_result.point_count
-                        ),
-                        "triangle_count": (
-                            region_result.triangle_count
-                        ),
-                        "coverage_angle": (
-                            fit_result.coverage_angle
-                        ),
-                        "confidence": pending[
-                            "confidence"
-                        ],
-                        "detected_diameter": detected_diameter,
-                        "nominal_diameter": final_diameter,
-                        "diameter_adjustment": (
-                            final_diameter - detected_diameter
-                        ),
-                        "length_mode": length_mode,
-                        "extension_factor": (
-                            extension_factor
-                            if length_mode
-                            == CylinderPreviewDialog.LENGTH_EXTENDED
-                            else 1.0
-                        ),
-                        "radial_tolerance": (
-                            fit_result.radial_tolerance
-                        ),
-                        "source_cell_ids": list(
-                            region_result.cell_ids
-                        ),
-                    },
+                spacing=float(
+                    pattern_settings["spacing"]
+                ),
+                quantity=quantity,
+            )
+        elif (
+            pattern_type
+            == CylinderPreviewDialog.PATTERN_CIRCULAR
+        ):
+            instances = create_circular_pattern(
+                master_center=final_center,
+                master_direction=final_direction,
+                axis_origin=(
+                    pattern_settings[
+                        "axis_origin"
+                    ]
+                ),
+                axis_direction=(
+                    pattern_settings[
+                        "axis_direction"
+                    ]
+                ),
+                angle_step_degrees=float(
+                    pattern_settings[
+                        "angle_step"
+                    ]
+                ),
+                quantity=quantity,
+                rotate_orientation=bool(
+                    pattern_settings[
+                        "rotate_orientation"
+                    ]
                 ),
             )
-        ]
-
-        if create_axis:
-            axis_record = (
-                self.references.create_record(
-                    final_axis_entity,
-                    name=(
-                        f"Eixo de "
-                        f"{cylinder_record.name}"
+        else:
+            instances = [
+                PatternInstance(
+                    index=0,
+                    center=tuple(final_center),
+                    direction=tuple(
+                        final_direction
                     ),
+                    parameter=0.0,
+                    is_master=True,
                 )
+            ]
+
+        commands = []
+        created_cylinder_names: list[str] = []
+        master_record_id: str | None = None
+        pattern_id = (
+            None
+            if pattern_type
+            == CylinderPreviewDialog.PATTERN_NONE
+            else f"pattern-{source_object.object_id}-{id(instances)}"
+        )
+
+        for instance in instances:
+            instance_entity = CylinderReference(
+                center=instance.center,
+                axis_direction=instance.direction,
+                radius=final_diameter / 2.0,
+                length=final_length,
+                rms_error=(
+                    cylinder_entity.rms_error
+                ),
+                coverage_angle=(
+                    cylinder_entity.coverage_angle
+                ),
+                source_object_id=(
+                    cylinder_entity.source_object_id
+                ),
+            )
+
+            if instance.is_master:
+                record_name = None
+            else:
+                record_name = (
+                    f"Instância {instance.index + 1:02d}"
+                )
+
+            cylinder_record = (
+                self.references.create_record(
+                    instance_entity,
+                    name=record_name,
+                )
+            )
+
+            if instance.is_master:
+                master_record_id = (
+                    cylinder_record.object_id
+                )
+
+            created_cylinder_names.append(
+                cylinder_record.name
+            )
+
+            instance_role = (
+                "master_recognized"
+                if instance.is_master
+                else "nominal_instance"
             )
 
             commands.append(
@@ -1901,106 +4638,440 @@ class MainWindow(QMainWindow):
                     project_panel=self.project_panel,
                     project_manager=self.project,
                     reference_manager=self.references,
-                    record=axis_record,
+                    record=cylinder_record,
                     display_geometry=(
-                        self.reference_factory.create_axis(
-                            final_axis_entity
+                        create_cylinder_reference_lines(
+                            instance_entity
                         )
                     ),
                     render_options={
-                        "color": "#4ea1ff",
+                        "color": "#70e000",
+                        "opacity": 0.82,
+                        "line_width": 2.0,
                         "lighting": False,
                         "ambient": 1.0,
                         "pickable": True,
                     },
                     metadata=ProjectObjectMetadata(
                         source_object_id=(
-                            cylinder_record.object_id
+                            source_object.object_id
                         ),
-                        created_by="system",
+                        created_by=(
+                            "user"
+                            if instance.is_master
+                            else "pattern_engine"
+                        ),
                         creation_method=(
-                            "axis_from_cylinder"
+                            "cylinder_fit_refined_region"
+                            if instance.is_master
+                            else (
+                                f"cylinder_pattern_"
+                                f"{pattern_type}"
+                            )
                         ),
-                    ),
-                )
-            )
-
-        if create_center:
-            center_record = (
-                self.references.create_record(
-                    center_entity,
-                    name=(
-                        f"Centro de "
-                        f"{cylinder_record.name}"
-                    ),
-                )
-            )
-
-            commands.append(
-                CreateReferenceCommand(
-                    scene=self.scene,
-                    project_panel=self.project_panel,
-                    project_manager=self.project,
-                    reference_manager=self.references,
-                    record=center_record,
-                    display_geometry=(
-                        self.reference_factory.create_point(
-                            center_entity,
-                            radius=max(
-                                self._reference_scale()
-                                * 0.006,
-                                0.35,
+                        rms_error=(
+                            fit_result.rms_error
+                            if instance.is_master
+                            else None
+                        ),
+                        custom={
+                            "maximum_error": (
+                                fit_result.maximum_error
+                                if instance.is_master
+                                else None
                             ),
-                        )
-                    ),
-                    render_options={
-                        "color": "#ff7a45",
-                        "smooth_shading": True,
-                        "ambient": 0.7,
-                        "diffuse": 0.3,
-                        "pickable": True,
-                    },
-                    metadata=ProjectObjectMetadata(
-                        source_object_id=(
-                            cylinder_record.object_id
-                        ),
-                        created_by="system",
-                        creation_method=(
-                            "center_from_cylinder"
-                        ),
+                            "point_count": (
+                                fit_result.point_count
+                                if instance.is_master
+                                else 0
+                            ),
+                            "triangle_count": (
+                                region_result.triangle_count
+                                if instance.is_master
+                                else 0
+                            ),
+                            "coverage_angle": (
+                                fit_result.coverage_angle
+                            ),
+                            "confidence": (
+                                pending["confidence"]
+                                if instance.is_master
+                                else None
+                            ),
+                            "quality_score": (
+                                pending["quality"].score
+                                if instance.is_master
+                                else None
+                            ),
+                            "quality_grade": (
+                                pending["quality"].grade
+                                if instance.is_master
+                                else None
+                            ),
+                            "quality_stars": (
+                                pending["quality"].stars
+                                if instance.is_master
+                                else None
+                            ),
+                            "circularity": (
+                                pending["quality"].circularity
+                                if instance.is_master
+                                else None
+                            ),
+                            "mean_absolute_error": (
+                                pending[
+                                    "quality"
+                                ].mean_absolute_error
+                                if instance.is_master
+                                else None
+                            ),
+                            "standard_deviation": (
+                                pending[
+                                    "quality"
+                                ].standard_deviation
+                                if instance.is_master
+                                else None
+                            ),
+                            "relative_rms_percent": (
+                                pending[
+                                    "quality"
+                                ].relative_rms_percent
+                                if instance.is_master
+                                else None
+                            ),
+                            "inlier_ratio": (
+                                pending[
+                                    "quality"
+                                ].inlier_ratio
+                                if instance.is_master
+                                else None
+                            ),
+                            "evaluated_point_count": (
+                                pending[
+                                    "quality"
+                                ].evaluated_point_count
+                                if instance.is_master
+                                else 0
+                            ),
+                            "quality_reasons": (
+                                list(
+                                    pending[
+                                        "quality"
+                                    ].reasons
+                                )
+                                if instance.is_master
+                                else []
+                            ),
+                            "detected_diameter": (
+                                detected_diameter
+                                if instance.is_master
+                                else None
+                            ),
+                            "nominal_diameter": (
+                                final_diameter
+                            ),
+                            "detected_center": (
+                                tuple(detected_center)
+                                if instance.is_master
+                                else None
+                            ),
+                            "nominal_center": tuple(
+                                instance.center
+                            ),
+                            "detected_direction": (
+                                tuple(
+                                    detected_direction
+                                )
+                                if instance.is_master
+                                else None
+                            ),
+                            "nominal_direction": tuple(
+                                instance.direction
+                            ),
+                            "property_state": (
+                                property_state
+                                if instance.is_master
+                                else "Instância nominal"
+                            ),
+                            "properties_locked": (
+                                properties_locked
+                            ),
+                            "recognized_length": (
+                                float(
+                                    cylinder_entity.length
+                                )
+                            ),
+                            "display_length": (
+                                float(final_length)
+                            ),
+                            "length_mode": length_mode,
+                            "extension_factor": (
+                                extension_factor
+                                if length_mode
+                                == CylinderPreviewDialog.LENGTH_EXTENDED
+                                else 1.0
+                            ),
+                            "pattern_id": pattern_id,
+                            "pattern_type": pattern_type,
+                            "pattern_role": instance_role,
+                            "pattern_index": (
+                                instance.index
+                            ),
+                            "pattern_parameter": (
+                                instance.parameter
+                            ),
+                            "pattern_quantity": (
+                                len(instances)
+                            ),
+                            "pattern_master_id": (
+                                master_record_id
+                            ),
+                            "pattern_settings": dict(
+                                pattern_settings
+                            ),
+                            "radial_tolerance": (
+                                fit_result.radial_tolerance
+                                if instance.is_master
+                                else None
+                            ),
+                            "source_cell_ids": (
+                                list(
+                                    region_result.cell_ids
+                                )
+                                if instance.is_master
+                                else []
+                            ),
+                            "recognition_seed_count": (
+                                int(
+                                    pending.get(
+                                        "seed_count",
+                                        1,
+                                    )
+                                )
+                                if instance.is_master
+                                else 0
+                            ),
+                            "recognition_seed_points": (
+                                [
+                                    tuple(point)
+                                    for point in pending.get(
+                                        "seed_points",
+                                        (),
+                                    )
+                                ]
+                                if instance.is_master
+                                else []
+                            ),
+                        },
                     ),
                 )
+            )
+
+            if create_axis:
+                axis_entity = (
+                    instance_entity.create_axis(
+                        display_extension=0.65
+                    )
+                )
+                axis_record = (
+                    self.references.create_record(
+                        axis_entity,
+                        name=(
+                            f"Eixo de "
+                            f"{cylinder_record.name}"
+                        ),
+                    )
+                )
+
+                commands.append(
+                    CreateReferenceCommand(
+                        scene=self.scene,
+                        project_panel=self.project_panel,
+                        project_manager=self.project,
+                        reference_manager=self.references,
+                        record=axis_record,
+                        display_geometry=(
+                            self.reference_factory.create_axis(
+                                axis_entity
+                            )
+                        ),
+                        render_options={
+                            "color": "#4ea1ff",
+                            "lighting": False,
+                            "ambient": 1.0,
+                            "pickable": True,
+                        },
+                        metadata=ProjectObjectMetadata(
+                            source_object_id=(
+                                cylinder_record.object_id
+                            ),
+                            created_by="pattern_engine",
+                            creation_method=(
+                                "axis_from_cylinder"
+                            ),
+                            custom={
+                                "pattern_id": pattern_id,
+                                "pattern_index": (
+                                    instance.index
+                                ),
+                                "derived_from": (
+                                    cylinder_record.object_id
+                                ),
+                                "cylinder_display_length": (
+                                    float(final_length)
+                                ),
+                                "axis_display_extension": 0.65,
+                            },
+                        ),
+                    )
+                )
+
+            if create_center:
+                center_entity = (
+                    instance_entity.create_center_point()
+                )
+                center_record = (
+                    self.references.create_record(
+                        center_entity,
+                        name=(
+                            f"Centro de "
+                            f"{cylinder_record.name}"
+                        ),
+                    )
+                )
+
+                commands.append(
+                    CreateReferenceCommand(
+                        scene=self.scene,
+                        project_panel=self.project_panel,
+                        project_manager=self.project,
+                        reference_manager=self.references,
+                        record=center_record,
+                        display_geometry=(
+                            self.reference_factory.create_point(
+                                center_entity,
+                                radius=max(
+                                    self._reference_scale()
+                                    * 0.0035,
+                                    0.25,
+                                ),
+                            )
+                        ),
+                        render_options={
+                            "color": "#ff7a45",
+                            "smooth_shading": True,
+                            "ambient": 0.7,
+                            "diffuse": 0.3,
+                            "pickable": True,
+                        },
+                        metadata=ProjectObjectMetadata(
+                            source_object_id=(
+                                cylinder_record.object_id
+                            ),
+                            created_by="pattern_engine",
+                            creation_method=(
+                                "center_from_cylinder"
+                            ),
+                            custom={
+                                "pattern_id": pattern_id,
+                                "pattern_index": (
+                                    instance.index
+                                ),
+                                "derived_from": (
+                                    cylinder_record.object_id
+                                ),
+                            },
+                        ),
+                    )
+                )
+
+        if len(instances) == 1:
+            description = (
+                f"Criar {created_cylinder_names[0]} "
+                "e referências derivadas"
+            )
+        else:
+            description = (
+                f"Criar padrão {pattern_type} "
+                f"com {len(instances)} cilindros"
             )
 
         batch = CreateReferenceBatchCommand(
-            description=(
-                f"Criar "
-                f"{cylinder_record.name} "
-                "e referências derivadas"
-            ),
+            description=description,
             commands=commands,
         )
 
-        self.history.execute(batch)
+        was_editing_existing = bool(
+            self._editing_object_ids
+        )
+
+        if self._editing_object_ids:
+            delete_command = DeleteObjectsCommand(
+                scene=self.scene,
+                project_panel=self.project_panel,
+                project_manager=self.project,
+                reference_manager=self.references,
+                object_ids=set(
+                    self._editing_object_ids
+                ),
+            )
+
+            history_command = CompositeProjectCommand(
+                description=(
+                    "Editar cilindro e atualizar padrão"
+                ),
+                commands=[
+                    delete_command,
+                    batch,
+                ],
+            )
+        else:
+            history_command = batch
+
+        self.history.execute(
+            history_command
+        )
+        self._editing_object_ids.clear()
         self.viewer.render()
 
         self._pending_cylinder_creation = None
 
-        self.statusBar().showMessage(
-            f"Criado: "
-            f"{cylinder_record.name} | "
-            f"Ø {final_cylinder_entity.diameter:.4f} mm | "
-            f"RMS {fit_result.rms_error:.4f} mm"
+        restart_production_mode = (
+            bool(self._cylinder_production_mode)
+            and not was_editing_existing
         )
+
+        self.statusBar().showMessage(
+            (
+                f"Criados {len(instances)} cilindro(s) | "
+                f"Ø {final_diameter:.4f} mm | "
+                f"Padrão: {pattern_type} | "
+                f"Qualidade: "
+                f"{pending['quality'].grade} "
+                f"({pending['quality'].score:.1f}%)"
+            )
+        )
+
+        if restart_production_mode:
+            self.statusBar().showMessage(
+                (
+                    "Cilindro criado. "
+                    "Modo produção ativo: aguardando próximo reconhecimento."
+                )
+            )
+            self.start_cylinder_region_mode()
 
     def cancel_cylinder_preview(self) -> None:
         """Cancela a prévia sem criar referências."""
 
         self._clear_cylinder_preview()
         self._pending_cylinder_creation = None
+        self._editing_object_ids.clear()
+        self._pending_cylinder_seed_points = []
+        self._pending_cylinder_source_object_id = None
 
         self.statusBar().showMessage(
-            "Criação do cilindro cancelada"
+            "Criação ou edição do cilindro cancelada"
         )
 
     def _release_cylinder_preview_dialog(
@@ -2017,35 +5088,43 @@ class MainWindow(QMainWindow):
         cylinder_entity: CylinderReference,
         axis_entity: AxisReference,
     ) -> None:
-        """Mostra região, cilindro e eixo provisórios."""
+        """Mostra região, cilindro, eixo e centro provisórios."""
 
         self._clear_cylinder_preview(
             render=False
         )
 
-        actors = (
+        actors = []
+
+        if region_geometry is not None:
+            actors.append(
+                self.viewer.add_mesh(
+                    region_geometry,
+                    name=self._cylinder_region_preview_name,
+                    color="#ffd166",
+                    opacity=0.80,
+                    show_edges=True,
+                    edge_color="#fff0b3",
+                    line_width=1.0,
+                    lighting=False,
+                )
+            )
+
+        actors.append(
             self.viewer.add_mesh(
-                region_geometry,
-                name=self._cylinder_region_preview_name,
-                color="#ffd166",
-                opacity=0.80,
-                show_edges=True,
-                edge_color="#fff0b3",
-                line_width=1.0,
-                lighting=False,
-            ),
-            self.viewer.add_mesh(
-                self.reference_factory.create_cylinder(
+                create_cylinder_reference_lines(
                     cylinder_entity
                 ),
                 name=self._cylinder_preview_name,
                 color="#70e000",
-                opacity=0.30,
-                show_edges=True,
-                edge_color="#b7ff8a",
-                line_width=1.5,
+                opacity=0.88,
+                line_width=2.0,
                 lighting=False,
-            ),
+                ambient=1.0,
+            )
+        )
+
+        actors.append(
             self.viewer.add_mesh(
                 self.reference_factory.create_axis(
                     axis_entity
@@ -2054,7 +5133,24 @@ class MainWindow(QMainWindow):
                 color="#4ea1ff",
                 lighting=False,
                 ambient=1.0,
-            ),
+            )
+        )
+
+        actors.append(
+            self.viewer.add_mesh(
+                self.reference_factory.create_point(
+                    cylinder_entity.create_center_point(),
+                    radius=max(
+                        self._reference_scale() * 0.0035,
+                        0.25,
+                    ),
+                ),
+                name=self._cylinder_center_preview_name,
+                color="#ff7a45",
+                smooth_shading=True,
+                ambient=0.8,
+                diffuse=0.2,
+            )
         )
 
         for actor in actors:
@@ -2069,13 +5165,17 @@ class MainWindow(QMainWindow):
         self,
         render: bool = True,
     ) -> None:
-        """Remove as geometrias provisórias."""
+        """Remove todas as geometrias provisórias."""
 
-        for actor_name in (
+        actor_names = [
             self._cylinder_region_preview_name,
             self._cylinder_preview_name,
             self._cylinder_axis_preview_name,
-        ):
+            self._cylinder_center_preview_name,
+            *self._cylinder_pattern_preview_names,
+        ]
+
+        for actor_name in actor_names:
             try:
                 self.viewer.remove_actor(
                     actor_name,
@@ -2083,6 +5183,8 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 pass
+
+        self._cylinder_pattern_preview_names = []
 
         if render:
             self.viewer.render()
@@ -2475,7 +5577,10 @@ class MainWindow(QMainWindow):
             self.enable_viewport_selection()
 
             self.statusBar().showMessage(
-                "Seleção de objetos ativa"
+                (
+                    "Seleção ativa — use Ctrl + clique curto. "
+                    "Arraste normalmente para rotacionar."
+                )
             )
             return
 
@@ -2498,62 +5603,536 @@ class MainWindow(QMainWindow):
         self.select_action.setChecked(False)
         self.select_action.blockSignals(False)
 
-    def enable_viewport_selection(self) -> None:
-        """Ativa seleção pela viewport."""
 
-        try:
-            self.viewer.disable_picking()
-        except Exception:
-            pass
+    def _vtk_interactor(
+        self,
+    ) -> Any:
+        """Retorna o interactor VTK real usado pelo QtInteractor."""
 
-        self.viewer.enable_mesh_picking(
-            callback=self.on_viewport_actor_picked,
-            show=False,
-            show_message=False,
-            left_clicking=True,
-            use_actor=True,
+        interactor = getattr(
+            self.viewer,
+            "iren",
+            None,
         )
 
+        if interactor is None:
+            return None
+
+        return getattr(
+            interactor,
+            "interactor",
+            interactor,
+        )
+
+
+    def enable_viewport_selection(self) -> None:
+        """
+        Ativa seleção pela viewport usando o filtro de eventos do Qt.
+
+        Esse caminho é mais confiável no QtInteractor do que depender
+        apenas de observadores VTK, que podem não receber o clique em
+        algumas versões do PyVistaQt/VTK.
+        """
+
+        self.disable_viewport_selection()
+
+        viewport_widget = self.viewer.interactor
+
+        if viewport_widget is None:
+            self.statusBar().showMessage(
+                "Não foi possível ativar a seleção da viewport"
+            )
+            return
+
+        viewport_widget.installEventFilter(self)
+        self._selection_event_filter_installed = True
+
     def disable_viewport_selection(self) -> None:
-        """Desativa picking."""
+        """Desativa o filtro Qt e remove observadores antigos."""
+
+        viewport_widget = getattr(
+            self.viewer,
+            "interactor",
+            None,
+        )
+
+        if (
+            viewport_widget is not None
+            and self._selection_event_filter_installed
+        ):
+            try:
+                viewport_widget.removeEventFilter(self)
+            except Exception:
+                pass
+
+        self._selection_event_filter_installed = False
+
+        vtk_interactor = self._vtk_interactor()
+
+        if vtk_interactor is not None:
+            for observer_id in self._selection_observer_ids:
+                try:
+                    vtk_interactor.RemoveObserver(
+                        observer_id
+                    )
+                except Exception:
+                    pass
+
+        self._selection_observer_ids = []
+        self._selection_press_position = None
+        self._selection_press_control = False
 
         try:
             self.viewer.disable_picking()
         except Exception:
             pass
+
+    def eventFilter(
+        self,
+        watched: Any,
+        event: Any,
+    ) -> bool:
+        """
+        Captura Ctrl + clique curto diretamente no widget da viewport.
+
+        Retorna False para que a navegação continue recebendo os eventos.
+        """
+
+        if (
+            watched is getattr(
+                self.viewer,
+                "interactor",
+                None,
+            )
+            and self._selection_event_filter_installed
+            and self.selection.active
+        ):
+            event_type = event.type()
+
+            if (
+                event_type
+                == QEvent.Type.MouseButtonPress
+                and event.button()
+                == Qt.MouseButton.LeftButton
+            ):
+                position = event.position()
+                self._selection_press_position = (
+                    int(position.x()),
+                    int(position.y()),
+                )
+                self._selection_press_control = bool(
+                    event.modifiers()
+                    & Qt.KeyboardModifier.ControlModifier
+                )
+
+            elif (
+                event_type
+                == QEvent.Type.MouseButtonRelease
+                and event.button()
+                == Qt.MouseButton.LeftButton
+            ):
+                press_position = (
+                    self._selection_press_position
+                )
+                control_pressed = (
+                    self._selection_press_control
+                    and bool(
+                        event.modifiers()
+                        & Qt.KeyboardModifier.ControlModifier
+                    )
+                )
+
+                self._selection_press_position = None
+                self._selection_press_control = False
+
+                if (
+                    press_position is not None
+                    and control_pressed
+                ):
+                    position = event.position()
+                    release_position = (
+                        int(position.x()),
+                        int(position.y()),
+                    )
+
+                    distance_squared = (
+                        (
+                            release_position[0]
+                            - press_position[0]
+                        ) ** 2
+                        + (
+                            release_position[1]
+                            - press_position[1]
+                        ) ** 2
+                    )
+
+                    if distance_squared <= (
+                        self._selection_drag_tolerance_px
+                        ** 2
+                    ):
+                        self._pick_viewport_at_qt_position(
+                            release_position
+                        )
+                    else:
+                        self.statusBar().showMessage(
+                            (
+                                "Movimento interpretado como rotação; "
+                                "nenhum objeto foi selecionado."
+                            )
+                        )
+
+        return super().eventFilter(
+            watched,
+            event,
+        )
+
+    def _pick_viewport_at_qt_position(
+        self,
+        position: tuple[int, int],
+    ) -> None:
+        """Converte coordenadas Qt e executa o picking VTK."""
+
+        viewport_widget = self.viewer.interactor
+        viewport_height = max(
+            int(viewport_widget.height()),
+            1,
+        )
+
+        vtk_x = int(position[0])
+        vtk_y = int(
+            viewport_height - position[1] - 1
+        )
+
+        actor = None
+
+        cell_picker = vtk.vtkCellPicker()
+        cell_picker.SetTolerance(0.01)
+
+        picked = cell_picker.Pick(
+            vtk_x,
+            vtk_y,
+            0.0,
+            self.viewer.renderer,
+        )
+
+        if picked:
+            actor = cell_picker.GetActor()
+
+            if actor is None:
+                actor = cell_picker.GetViewProp()
+
+        if actor is None:
+            prop_picker = vtk.vtkPropPicker()
+            picked = prop_picker.Pick(
+                vtk_x,
+                vtk_y,
+                0.0,
+                self.viewer.renderer,
+            )
+
+            if picked:
+                actor = prop_picker.GetActor()
+
+                if actor is None:
+                    actor = prop_picker.GetViewProp()
+
+        if actor is None:
+            self.statusBar().showMessage(
+                "Nenhum objeto encontrado sob o cursor"
+            )
+            return
+
+        self.on_viewport_actor_picked(actor)
+
+    def _on_selection_left_press(
+        self,
+        interactor: Any,
+        event_name: str,
+    ) -> None:
+        """Registra a posição inicial sem interromper a navegação."""
+
+        if not self.selection.active:
+            return
+
+        position = interactor.GetEventPosition()
+        self._selection_press_position = (
+            int(position[0]),
+            int(position[1]),
+        )
+        self._selection_press_control = bool(
+            interactor.GetControlKey()
+        )
+
+
+    def _on_selection_left_release(
+        self,
+        interactor: Any,
+        event_name: str,
+    ) -> None:
+        """Seleciona com Ctrl + clique curto sem bloquear a rotação."""
+
+        if (
+            not self.selection.active
+            or self._selection_press_position is None
+        ):
+            return
+
+        release = interactor.GetEventPosition()
+        release_position = (
+            int(release[0]),
+            int(release[1]),
+        )
+        press_position = self._selection_press_position
+        control_pressed = (
+            self._selection_press_control
+            and bool(interactor.GetControlKey())
+        )
+
+        self._selection_press_position = None
+        self._selection_press_control = False
+
+        distance_squared = (
+            (
+                release_position[0]
+                - press_position[0]
+            ) ** 2
+            + (
+                release_position[1]
+                - press_position[1]
+            ) ** 2
+        )
+
+        if not control_pressed:
+            return
+
+        if distance_squared > (
+            self._selection_drag_tolerance_px ** 2
+        ):
+            self.statusBar().showMessage(
+                (
+                    "Movimento interpretado como rotação; "
+                    "nenhum objeto foi selecionado."
+                )
+            )
+            return
+
+        actor = None
+
+        # vtkCellPicker é mais confiável para malhas, planos,
+        # cilindros em linhas e pequenas referências.
+        cell_picker = vtk.vtkCellPicker()
+        cell_picker.SetTolerance(0.006)
+        picked = cell_picker.Pick(
+            release_position[0],
+            release_position[1],
+            0.0,
+            self.viewer.renderer,
+        )
+
+        if picked:
+            actor = cell_picker.GetActor()
+
+            if actor is None:
+                actor = cell_picker.GetViewProp()
+
+        # Fallback para atores sem células selecionáveis.
+        if actor is None:
+            prop_picker = vtk.vtkPropPicker()
+            picked = prop_picker.Pick(
+                release_position[0],
+                release_position[1],
+                0.0,
+                self.viewer.renderer,
+            )
+
+            if picked:
+                actor = prop_picker.GetActor()
+
+                if actor is None:
+                    actor = prop_picker.GetViewProp()
+
+        if actor is None:
+            self.statusBar().showMessage(
+                "Nenhum objeto encontrado sob o cursor"
+            )
+            return
+
+        self.on_viewport_actor_picked(actor)
+
 
     def on_viewport_actor_picked(
         self,
         actor: Any,
     ) -> None:
-        """Alterna seleção do objeto clicado."""
+        """Resolve o ator para o objeto lógico e alterna sua seleção."""
 
         if not self.selection.active:
             return
 
-        self.selection.toggle_actor(actor)
+        scene_object = self.scene.get_object_by_actor(
+            actor
+        )
+
+        if scene_object is None:
+            # Alguns pickers retornam o vtkProp interno do wrapper
+            # PyVista. Comparamos endereços VTK como fallback.
+            try:
+                picked_address = actor.GetAddressAsString(
+                    ""
+                )
+            except Exception:
+                picked_address = None
+
+            if picked_address is not None:
+                for object_id in self.scene.object_ids():
+                    candidate = self.scene.get_object(
+                        object_id
+                    )
+
+                    if candidate is None:
+                        continue
+
+                    try:
+                        candidate_address = (
+                            candidate.actor.GetAddressAsString(
+                                ""
+                            )
+                        )
+                    except Exception:
+                        continue
+
+                    if candidate_address == picked_address:
+                        scene_object = candidate
+                        break
+
+        if scene_object is None:
+            self.statusBar().showMessage(
+                (
+                    "O elemento foi localizado na viewport, "
+                    "mas não está vinculado à árvore do projeto."
+                )
+            )
+            return
+
+        # Usa o mesmo caminho da seleção pela árvore, garantindo
+        # sincronização visual e lógica.
+        self.selection.toggle(
+            scene_object.object_id
+        )
 
     def on_selection_changed(
         self,
         selected_ids: set[str],
     ) -> None:
-        """Recebe mudanças na seleção."""
+        """Recebe mudanças e informa operações disponíveis."""
 
         if self.delete_dialog is not None:
             self.delete_dialog.set_selected_objects(
                 self.selection.selected_names()
             )
 
-        count_selected = len(selected_ids)
+        type_counts: dict[str, int] = {}
 
-        if count_selected == 0:
-            message = "Nenhum objeto selecionado"
-        elif count_selected == 1:
-            message = "1 objeto selecionado"
-        else:
-            message = (
-                f"{count_selected} objetos selecionados"
+        for object_id in selected_ids:
+            scene_object = self.scene.get_object(
+                object_id
             )
+
+            if scene_object is None:
+                continue
+
+            object_type = scene_object.object_type
+            type_counts[object_type] = (
+                type_counts.get(object_type, 0)
+                + 1
+            )
+
+        mesh_count = type_counts.get("mesh", 0)
+        plane_count = type_counts.get(
+            "reference_plane",
+            0,
+        )
+        cylinder_count = type_counts.get(
+            "reference_cylinder",
+            0,
+        )
+        axis_count = type_counts.get(
+            "reference_axis",
+            0,
+        )
+
+        parts: list[str] = []
+
+        if mesh_count:
+            parts.append(
+                f"{mesh_count} malha"
+                f"{'s' if mesh_count != 1 else ''}"
+            )
+
+        if plane_count:
+            parts.append(
+                f"{plane_count} plano"
+                f"{'s' if plane_count != 1 else ''}"
+            )
+
+        if cylinder_count:
+            parts.append(
+                f"{cylinder_count} cilindro"
+                f"{'s' if cylinder_count != 1 else ''}"
+            )
+
+        if axis_count:
+            parts.append(
+                f"{axis_count} eixo"
+                f"{'s' if axis_count != 1 else ''}"
+            )
+
+        other_count = (
+            len(selected_ids)
+            - mesh_count
+            - plane_count
+            - cylinder_count
+            - axis_count
+        )
+
+        if other_count > 0:
+            parts.append(
+                f"{other_count} outro"
+                f"{'s' if other_count != 1 else ''}"
+            )
+
+        if not selected_ids:
+            message = (
+                "Nenhum objeto selecionado — "
+                "Ctrl + clique curto para selecionar"
+            )
+        else:
+            message = "Selecionado: " + ", ".join(
+                parts
+            )
+
+            if (
+                mesh_count == 1
+                and plane_count == 1
+                and len(selected_ids) == 2
+            ):
+                message += (
+                    " | ✓ Pronto para alinhamento por plano"
+                )
+            elif (
+                mesh_count == 1
+                and (
+                    cylinder_count + axis_count
+                ) == 1
+                and len(selected_ids) == 2
+            ):
+                message += (
+                    " | ✓ Pronto para alinhamento por eixo"
+                )
+            elif mesh_count == 1:
+                message += (
+                    " | Selecione um plano, cilindro ou eixo"
+                )
 
         if self.delete_mode_active:
             message = f"Modo Deletar — {message}"
@@ -2600,6 +6179,13 @@ class MainWindow(QMainWindow):
 
         self.delete_dialog.show()
         self.delete_dialog.raise_()
+
+        self.statusBar().showMessage(
+            (
+                "Modo Deletar — selecione com Ctrl + clique curto; "
+                "arraste para rotacionar normalmente."
+            )
+        )
 
     def confirm_delete_selected(self) -> None:
         """Confirma a exclusão."""

@@ -3,6 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+import numpy as np
+import vtk
+
 from core.command_history import Command
 from core.project_manager import ProjectManager
 from core.project_model import (
@@ -425,3 +428,179 @@ class CreateReferenceBatchCommand(Command):
             self._commands
         ):
             command.undo()
+
+
+
+class CompositeProjectCommand(Command):
+    """Executa vários comandos como uma única etapa de Undo/Redo."""
+
+    def __init__(
+        self,
+        description: str,
+        commands: list[Command],
+    ) -> None:
+        self._description = description
+        self._commands = list(commands)
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    def execute(self) -> None:
+        executed: list[Command] = []
+
+        try:
+            for command in self._commands:
+                command.execute()
+                executed.append(command)
+        except Exception:
+            for command in reversed(executed):
+                command.undo()
+            raise
+
+    def undo(self) -> None:
+        for command in reversed(self._commands):
+            command.undo()
+
+
+
+class TransformSceneObjectsCommand(Command):
+    """
+    Aplica uma matriz 4 × 4 a vários atores com Undo/Redo.
+
+    Esta primeira fundação de alinhamento transforma a representação
+    da cena. A incorporação definitiva da matriz aos dados-fonte da
+    malha será uma evolução posterior do Geometry Engine.
+    """
+
+    def __init__(
+        self,
+        *,
+        scene: SceneManager,
+        object_ids: set[str],
+        transform: Any,
+        description: str,
+    ) -> None:
+        self.scene = scene
+        self.object_ids = tuple(
+            sorted(object_ids)
+        )
+        self.transform = np.asarray(
+            transform,
+            dtype=float,
+        )
+
+        if self.transform.shape != (4, 4):
+            raise ValueError(
+                "A transformação deve ser uma matriz 4 × 4."
+            )
+
+        self._description = description
+        self._old_matrices: dict[
+            str,
+            np.ndarray,
+        ] = {}
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    def execute(self) -> None:
+        if not self._old_matrices:
+            for object_id in self.object_ids:
+                scene_object = (
+                    self.scene.get_object(
+                        object_id
+                    )
+                )
+
+                if scene_object is None:
+                    continue
+
+                self._old_matrices[
+                    object_id
+                ] = self._actor_matrix(
+                    scene_object.actor
+                )
+
+        for object_id in self.object_ids:
+            scene_object = self.scene.get_object(
+                object_id
+            )
+
+            if scene_object is None:
+                continue
+
+            old_matrix = self._old_matrices.get(
+                object_id,
+                np.eye(4),
+            )
+            new_matrix = (
+                self.transform @ old_matrix
+            )
+
+            self._set_actor_matrix(
+                scene_object.actor,
+                new_matrix,
+            )
+
+        self.scene.viewer.render()
+
+    def undo(self) -> None:
+        for object_id, matrix in (
+            self._old_matrices.items()
+        ):
+            scene_object = self.scene.get_object(
+                object_id
+            )
+
+            if scene_object is None:
+                continue
+
+            self._set_actor_matrix(
+                scene_object.actor,
+                matrix,
+            )
+
+        self.scene.viewer.render()
+
+    def _actor_matrix(
+        self,
+        actor: Any,
+    ) -> np.ndarray:
+        vtk_matrix = actor.GetUserMatrix()
+
+        if vtk_matrix is None:
+            return np.eye(4)
+
+        result = np.eye(4)
+
+        for row in range(4):
+            for column in range(4):
+                result[row, column] = (
+                    vtk_matrix.GetElement(
+                        row,
+                        column,
+                    )
+                )
+
+        return result
+
+    def _set_actor_matrix(
+        self,
+        actor: Any,
+        matrix: np.ndarray,
+    ) -> None:
+        vtk_matrix = vtk.vtkMatrix4x4()
+
+        for row in range(4):
+            for column in range(4):
+                vtk_matrix.SetElement(
+                    row,
+                    column,
+                    float(
+                        matrix[row, column]
+                    ),
+                )
+
+        actor.SetUserMatrix(vtk_matrix)

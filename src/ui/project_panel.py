@@ -36,6 +36,7 @@ class ProjectPanel(QWidget):
 
     visibility_changed = Signal(str, bool)
     object_selection_toggled = Signal(str)
+    object_double_clicked = Signal(str)
 
     VISIBLE_SYMBOL = "●"
     HIDDEN_SYMBOL = "○"
@@ -71,15 +72,33 @@ class ProjectPanel(QWidget):
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderHidden(True)
-        self.tree.setColumnWidth(0, 42)
-        self.tree.setIndentation(18)
+        # A primeira coluna contém o indicador de visibilidade.
+        # Ela precisa considerar a indentação dos subgrupos para que
+        # o marcador não invada o nome do objeto.
+        self.tree.setColumnWidth(0, 76)
+        self.tree.setIndentation(16)
 
         self.tree.setSelectionMode(
             QAbstractItemView.SelectionMode.MultiSelection
         )
+        self.tree.setStyleSheet(
+            """
+            QTreeWidget::item:selected {
+                background-color: #275d78;
+                color: #ffffff;
+                border: 1px solid #63d5ff;
+            }
+            QTreeWidget::item:selected:active {
+                background-color: #2e6f91;
+            }
+            """
+        )
 
         self.tree.itemClicked.connect(
             self._on_item_clicked
+        )
+        self.tree.itemDoubleClicked.connect(
+            self._on_item_double_clicked
         )
 
         layout = QVBoxLayout(self)
@@ -151,6 +170,31 @@ class ProjectPanel(QWidget):
             subgroup.setExpanded(True)
 
         self.tree.blockSignals(False)
+
+
+    def _on_item_double_clicked(
+        self,
+        item: QTreeWidgetItem,
+        column: int,
+    ) -> None:
+        """Solicita a edição da entidade acionada na árvore."""
+
+        object_id = item.data(
+            1,
+            Qt.ItemDataRole.UserRole,
+        )
+        item_kind = item.data(
+            1,
+            Qt.ItemDataRole.UserRole + 1,
+        )
+
+        if (
+            item_kind == "object"
+            and isinstance(object_id, str)
+        ):
+            self.object_double_clicked.emit(
+                object_id
+            )
 
     def set_selection_mode_active(
         self,
@@ -228,12 +272,22 @@ class ProjectPanel(QWidget):
 
         object_item.setTextAlignment(
             0,
-            Qt.AlignmentFlag.AlignCenter,
+            (
+                Qt.AlignmentFlag.AlignRight
+                | Qt.AlignmentFlag.AlignVCenter
+            ),
+        )
+        object_item.setTextAlignment(
+            1,
+            (
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+            ),
         )
 
         visibility_font = QFont()
         visibility_font.setBold(True)
-        visibility_font.setPointSize(13)
+        visibility_font.setPointSize(10)
         object_item.setFont(0, visibility_font)
 
         self._object_items[object_id] = object_item

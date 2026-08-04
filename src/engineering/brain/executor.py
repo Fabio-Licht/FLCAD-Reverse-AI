@@ -4,40 +4,34 @@ executor.py
 FLCAD Reverse AI
 
 Engineering Brain
-
-Executes Engineering Strategies.
 """
 
 from __future__ import annotations
+
+from engineering.adapters.recognition_adapter import RecognitionAdapter
+from engineering.capabilities.capability_manager import CapabilityManager
 
 from engineering.domain.engineering_strategy import EngineeringStrategy
 from engineering.domain.engineering_task import EngineeringTask
 
 
 class Executor:
-    """
-    Executes Engineering Strategies.
 
-    Current version:
+    def __init__(self) -> None:
 
-        Sequential execution.
+        self._capabilities = CapabilityManager()
 
-    Future versions:
-
-        Parallel execution
-        Distributed execution
-        Cloud execution
-    """
+        self._capabilities.register_provider(
+            RecognitionAdapter()
+        )
 
     def execute(
         self,
         strategy: EngineeringStrategy,
     ) -> EngineeringStrategy:
-        """
-        Executes every task in the strategy.
-        """
 
         for task in strategy.tasks:
+
             self.execute_task(task)
 
         return strategy
@@ -46,24 +40,9 @@ class Executor:
         self,
         task: EngineeringTask,
     ) -> None:
-        """
-        Executes one engineering task.
-
-        Current implementation only simulates execution.
-        """
 
         task.start()
 
-        #
-        # Future:
-        #
-        # Capability Manager
-        #
-        # Recognition Engine
-        #
-        # CAD Engine
-        #
-        # Mesh Engine
-        #
+        self._capabilities.execute(task)
 
         task.complete()

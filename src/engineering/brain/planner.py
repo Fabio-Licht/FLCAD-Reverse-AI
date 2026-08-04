@@ -109,6 +109,8 @@ class Planner:
                     name="Detect Planes",
 
                     engine="Recognition Engine",
+
+                    capability="recognition.detect_planes",
                 )
             )
 
@@ -121,6 +123,8 @@ class Planner:
                     name="Detect Cylinders",
 
                     engine="Recognition Engine",
+
+                    capability="recognition.detect_cylinders",
                 )
             )
 
@@ -133,6 +137,8 @@ class Planner:
                     name="Generate References",
 
                     engine="Engineering Kernel",
+
+                    capability="kernel.generate_references",
                 )
             )
 

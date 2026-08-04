@@ -47,6 +47,8 @@ class EngineeringTask:
 
     engine: str = ""
 
+    capability: str = ""
+
     priority: TaskPriority = TaskPriority.NORMAL
 
     state: WorkflowState = WorkflowState.CREATED

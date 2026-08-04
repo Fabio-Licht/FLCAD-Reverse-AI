@@ -53,8 +53,9 @@ class CylinderRegionDialog(QDialog):
             "Reconhecer cilindro por região"
         )
         self.setModal(False)
-        self.resize(450, 420)
+        self.resize(450, 360)
         self.setMinimumWidth(420)
+        self.setMinimumHeight(340)
 
         explanation = QLabel(
             (
@@ -240,7 +241,8 @@ class CylinderRegionDialog(QDialog):
             "Histórico da sessão"
         )
         self.history_list = QListWidget()
-        self.history_list.setMinimumHeight(105)
+        self.history_list.setMaximumHeight(70)
+        self.history_list.setMinimumHeight(50)
         self.history_list.setToolTip(
             (
                 "Cada recálculo válido fica registrado. "
@@ -288,7 +290,7 @@ class CylinderRegionDialog(QDialog):
         self.recalculate_button.setEnabled(False)
 
         self.continue_button = QPushButton(
-            "Abrir propriedades"
+            "Criar cilindro"
         )
         self.continue_button.clicked.connect(
             self.continue_requested.emit
@@ -312,6 +314,8 @@ class CylinderRegionDialog(QDialog):
         second_row.addWidget(self.cancel_button)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10,10,10,10)
+        layout.setSpacing(6)
         layout.addWidget(explanation)
         layout.addLayout(form)
         layout.addWidget(self.progress_label)
@@ -322,7 +326,9 @@ class CylinderRegionDialog(QDialog):
             "Lote de cilindros: 0"
         )
         self.batch_list = QListWidget()
-        self.batch_list.setMinimumHeight(85)
+        self.batch_list.setMaximumHeight(55)
+        self.batch_list.setMaximumHeight(55)
+        self.batch_list.setMinimumHeight(35)
 
         self.add_batch_button = QPushButton(
             "Adicionar resultado ao lote"
@@ -348,7 +354,7 @@ class CylinderRegionDialog(QDialog):
         layout.addWidget(self.batch_label)
         layout.addWidget(self.batch_list)
         layout.addLayout(batch_row)
-        layout.addStretch()
+        
         layout.addLayout(first_row)
         layout.addLayout(second_row)
 

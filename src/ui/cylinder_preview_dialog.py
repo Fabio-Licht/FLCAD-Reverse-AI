@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import acos, atan2, cos, degrees, radians, sin, sqrt
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -105,8 +105,11 @@ class CylinderPreviewDialog(QDialog):
         self.setWindowModality(
             Qt.WindowModality.NonModal
         )
-        self.resize(620, 720)
-        self.setMinimumSize(560, 560)
+        screen = QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+        self.resize(min(620, available.width()-80), min(680, available.height()-80))
+        self.setMinimumSize(560, 520)
+        self.setMaximumSize(available.width()-40, available.height()-40)
 
         self.status_label = QLabel()
         status_font = QFont()

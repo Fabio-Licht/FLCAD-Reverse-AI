@@ -92,6 +92,20 @@ from visualization.engine.scene import SceneManager
 from visualization.engine.selection_manager import (
     SelectionManager,
 )
+from application.visualization.recognition.recognition_visualization_service import (
+    RecognitionVisualizationService,
+)
+from application.interaction.context_menu_service import ContextMenuService
+from application.interaction.inspection_service import InspectionService
+from application.interaction.interaction_controller import InteractionController
+from application.interaction.interaction_settings import InteractionSettings
+from application.interaction.property_service import PropertyService
+from application.interaction.selection_service import (
+    SelectionService as EngineeringSelectionService,
+)
+from domain.reference.managers.reference_manager import (
+    ReferenceManager as EngineeringReferenceManager,
+)
 
 
 class MainWindow(QMainWindow):
@@ -190,6 +204,40 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.viewer)
 
         self.scene = SceneManager(self.viewer)
+        self.recognition_visualization = RecognitionVisualizationService(
+            self.scene
+        )
+        self.engineering_reference_manager = EngineeringReferenceManager()
+        self.engineering_interaction_settings = InteractionSettings(
+            enable_multi_selection=True,
+            enable_context_menu=True,
+            enable_hover_highlight=False,
+            enable_inspector=True,
+        )
+        self.engineering_property_service = PropertyService()
+        self.engineering_inspection_service = InspectionService(
+            self.engineering_property_service
+        )
+        self.engineering_selection_service = EngineeringSelectionService(
+            self.scene,
+            self.engineering_interaction_settings,
+        )
+        self.engineering_context_menu_service = ContextMenuService(
+            self.engineering_reference_manager,
+            self.recognition_visualization,
+        )
+        self.engineering_interaction = InteractionController(
+            self.engineering_selection_service,
+            self.engineering_inspection_service,
+            self.engineering_context_menu_service,
+            self.engineering_interaction_settings,
+        )
+        self.recognition_visualization.attach_interaction_controller(
+            self.engineering_interaction
+        )
+        self.engineering_inspection_service.subscribe(
+            self._on_engineering_inspection
+        )
         self.project = ProjectManager()
         self.references = ReferenceManager()
 
@@ -5290,6 +5338,17 @@ class MainWindow(QMainWindow):
         if scene_object is None:
             return
 
+        engineering_menu = self.engineering_interaction.context_menu(
+            pick_result.object_id,
+            self,
+        )
+
+        if engineering_menu is not None:
+            engineering_menu.exec(
+                self.viewer.interactor.mapToGlobal(position)
+            )
+            return
+
         self._context_point = pick_result.point
         self._context_object_id = (
             pick_result.object_id
@@ -6138,6 +6197,19 @@ class MainWindow(QMainWindow):
             message = f"Modo Deletar — {message}"
 
         self.statusBar().showMessage(message)
+        self.engineering_interaction.synchronize_selection(selected_ids)
+
+    def _on_engineering_inspection(self, snapshot: Any) -> None:
+        """Present the current read-only engineering inspection summary."""
+
+        if snapshot is None:
+            return
+
+        summary = " | ".join(
+            f"{name}: {value}"
+            for name, value in snapshot.properties
+        )
+        self.statusBar().showMessage(summary)
 
     def start_delete_mode(self) -> None:
         """Abre o modo de exclusão."""

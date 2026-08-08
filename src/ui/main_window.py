@@ -103,6 +103,7 @@ from application.interaction.property_service import PropertyService
 from application.interaction.selection_service import (
     SelectionService as EngineeringSelectionService,
 )
+from application.recognition.recognition_session import RecognitionSession
 from domain.reference.managers.reference_manager import (
     ReferenceManager as EngineeringReferenceManager,
 )
@@ -175,6 +176,10 @@ class MainWindow(QMainWindow):
             "__flcad_cylinder_center_preview__"
         )
         self._cylinder_pattern_preview_names: list[str] = []
+        self._active_cylinder_region_preview_name: str | None = None
+        self._active_cylinder_preview_name: str | None = None
+        self._active_cylinder_axis_preview_name: str | None = None
+        self._active_cylinder_center_preview_name: str | None = None
 
         self._cylinder_preview_dialog = None
         self._cylinder_region_dialog = None
@@ -204,6 +209,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.viewer)
 
         self.scene = SceneManager(self.viewer)
+        self.recognition_session = RecognitionSession(
+            remove_preview=self._remove_recognition_preview,
+            render_previews=self.viewer.render,
+        )
         self.recognition_visualization = RecognitionVisualizationService(
             self.scene
         )
@@ -2151,6 +2160,14 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.clear_state()
 
+    def _remove_recognition_preview(self, actor_name: str) -> None:
+        """Remove one session-owned preview without affecting scene objects."""
+
+        try:
+            self.viewer.remove_actor(actor_name, render=False)
+        except Exception:
+            pass
+
     def cancel_plane_region_mode(self) -> None:
         """Encerra o painel interativo de planos."""
 
@@ -2234,13 +2251,35 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Mostra região, plano, centro e normal provisórios."""
 
-        self._clear_plane_region_preview(
-            render=False
+        self.recognition_session.begin_preview(
+            getattr(plane_entity, "source_object_id", None),
+            multi_recognition=False,
         )
+
+        region_name = self.recognition_session.preview_name(
+            self._plane_region_preview_name
+        )
+        plane_name = self.recognition_session.preview_name(
+            self._plane_preview_name
+        )
+        center_name = self.recognition_session.preview_name(
+            self._plane_center_preview_name
+        )
+        normal_name = self.recognition_session.preview_name(
+            self._plane_normal_preview_name
+        )
+
+        for actor_name in (
+            region_name,
+            plane_name,
+            center_name,
+            normal_name,
+        ):
+            self.recognition_session.register(actor_name)
 
         region_actor = self.viewer.add_mesh(
             region_geometry,
-            name=self._plane_region_preview_name,
+            name=region_name,
             color="#ffd166",
             opacity=0.78,
             show_edges=True,
@@ -2253,7 +2292,7 @@ class MainWindow(QMainWindow):
             self.reference_factory.create_plane(
                 plane_entity
             ),
-            name=self._plane_preview_name,
+            name=plane_name,
             color="#4ecdc4",
             opacity=0.32,
             show_edges=True,
@@ -2275,7 +2314,7 @@ class MainWindow(QMainWindow):
                     0.30,
                 ),
             ),
-            name=self._plane_center_preview_name,
+            name=center_name,
             color="#ff7a45",
             smooth_shading=True,
             ambient=0.8,
@@ -2298,7 +2337,7 @@ class MainWindow(QMainWindow):
             self.reference_factory.create_axis(
                 normal_entity
             ),
-            name=self._plane_normal_preview_name,
+            name=normal_name,
             color="#4ea1ff",
             lighting=False,
             ambient=1.0,
@@ -2322,22 +2361,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Remove todos os elementos temporários do reconhecimento."""
 
-        for actor_name in (
-            self._plane_region_preview_name,
-            self._plane_preview_name,
-            self._plane_center_preview_name,
-            self._plane_normal_preview_name,
-        ):
-            try:
-                self.viewer.remove_actor(
-                    actor_name,
-                    render=False,
-                )
-            except Exception:
-                pass
-
-        if render:
-            self.viewer.render()
+        self.recognition_session.clear(render=render)
     def _orient_normal_to_camera(
         self,
         origin: tuple[float, float, float],
@@ -3085,6 +3109,9 @@ class MainWindow(QMainWindow):
         dialog.add_to_batch_requested.connect(
             self.add_pending_cylinder_to_batch
         )
+        dialog.multi_recognition_checkbox.toggled.connect(
+            self.recognition_session.set_multi_recognition
+        )
         dialog.create_batch_requested.connect(
             self.create_cylinder_batch
         )
@@ -3754,7 +3781,8 @@ class MainWindow(QMainWindow):
         self._pending_cylinder_source_object_id = None
         self._cylinder_recognition_history = []
         dialog.clear_history_results()
-        self._clear_cylinder_preview()
+        self.recognition_session.commit_current()
+        self.viewer.render()
 
         try:
             self.viewer.disable_picking()
@@ -4076,6 +4104,7 @@ class MainWindow(QMainWindow):
             self._cylinder_batch_queue
         )
         self._cylinder_batch_queue = []
+        self.recognition_session.clear(render=False)
         self.viewer.render()
 
         if dialog is not None:
@@ -4379,11 +4408,14 @@ class MainWindow(QMainWindow):
             return
 
         for actor_name in [
-            self._cylinder_preview_name,
-            self._cylinder_axis_preview_name,
-            self._cylinder_center_preview_name,
+            self._active_cylinder_preview_name,
+            self._active_cylinder_axis_preview_name,
+            self._active_cylinder_center_preview_name,
             *self._cylinder_pattern_preview_names,
         ]:
+            if actor_name is None:
+                continue
+
             try:
                 self.viewer.remove_actor(
                     actor_name,
@@ -4392,7 +4424,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+            self.recognition_session.forget(actor_name)
+
         self._cylinder_pattern_preview_names = []
+        self._active_cylinder_preview_name = None
+        self._active_cylinder_axis_preview_name = None
+        self._active_cylinder_center_preview_name = None
         actors = []
 
         for instance in instances:
@@ -4415,10 +4452,13 @@ class MainWindow(QMainWindow):
                 f"{instance.index:03d}"
             )
 
-            cylinder_name = f"{prefix}_cylinder"
+            cylinder_name = self.recognition_session.preview_name(
+                f"{prefix}_cylinder"
+            )
             self._cylinder_pattern_preview_names.append(
                 cylinder_name
             )
+            self.recognition_session.register(cylinder_name)
             actors.append(
                 self.viewer.add_mesh(
                     create_cylinder_reference_lines(
@@ -4446,10 +4486,13 @@ class MainWindow(QMainWindow):
             )
 
             if create_axis:
-                axis_name = f"{prefix}_axis"
+                axis_name = self.recognition_session.preview_name(
+                    f"{prefix}_axis"
+                )
                 self._cylinder_pattern_preview_names.append(
                     axis_name
                 )
+                self.recognition_session.register(axis_name)
                 actors.append(
                     self.viewer.add_mesh(
                         self.reference_factory.create_axis(
@@ -4470,10 +4513,13 @@ class MainWindow(QMainWindow):
                 )
 
             if create_center:
-                center_name = f"{prefix}_center"
+                center_name = self.recognition_session.preview_name(
+                    f"{prefix}_center"
+                )
                 self._cylinder_pattern_preview_names.append(
                     center_name
                 )
+                self.recognition_session.register(center_name)
                 actors.append(
                     self.viewer.add_mesh(
                         self.reference_factory.create_point(
@@ -5138,9 +5184,52 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Mostra região, cilindro, eixo e centro provisórios."""
 
-        self._clear_cylinder_preview(
-            render=False
+        dialog = self._cylinder_region_dialog
+        multi_recognition = bool(
+            dialog is not None
+            and dialog.multi_recognition_enabled()
         )
+        self.recognition_session.begin_preview(
+            cylinder_entity.source_object_id,
+            multi_recognition=multi_recognition,
+        )
+
+        self._active_cylinder_region_preview_name = (
+            self.recognition_session.preview_name(
+                self._cylinder_region_preview_name
+            )
+        )
+        self._active_cylinder_preview_name = (
+            self.recognition_session.preview_name(
+                self._cylinder_preview_name
+            )
+        )
+        self._active_cylinder_axis_preview_name = (
+            self.recognition_session.preview_name(
+                self._cylinder_axis_preview_name
+            )
+        )
+        self._active_cylinder_center_preview_name = (
+            self.recognition_session.preview_name(
+                self._cylinder_center_preview_name
+            )
+        )
+
+        for actor_name in (
+            self._active_cylinder_preview_name,
+            self._active_cylinder_axis_preview_name,
+            self._active_cylinder_center_preview_name,
+        ):
+            if actor_name is not None:
+                self.recognition_session.register(actor_name)
+
+        if (
+            region_geometry is not None
+            and self._active_cylinder_region_preview_name is not None
+        ):
+            self.recognition_session.register(
+                self._active_cylinder_region_preview_name
+            )
 
         actors = []
 
@@ -5148,7 +5237,7 @@ class MainWindow(QMainWindow):
             actors.append(
                 self.viewer.add_mesh(
                     region_geometry,
-                    name=self._cylinder_region_preview_name,
+                    name=self._active_cylinder_region_preview_name,
                     color="#ffd166",
                     opacity=0.80,
                     show_edges=True,
@@ -5163,7 +5252,7 @@ class MainWindow(QMainWindow):
                 create_cylinder_reference_lines(
                     cylinder_entity
                 ),
-                name=self._cylinder_preview_name,
+                name=self._active_cylinder_preview_name,
                 color="#70e000",
                 opacity=0.88,
                 line_width=2.0,
@@ -5177,7 +5266,7 @@ class MainWindow(QMainWindow):
                 self.reference_factory.create_axis(
                     axis_entity
                 ),
-                name=self._cylinder_axis_preview_name,
+                name=self._active_cylinder_axis_preview_name,
                 color="#4ea1ff",
                 lighting=False,
                 ambient=1.0,
@@ -5193,7 +5282,7 @@ class MainWindow(QMainWindow):
                         0.25,
                     ),
                 ),
-                name=self._cylinder_center_preview_name,
+                name=self._active_cylinder_center_preview_name,
                 color="#ff7a45",
                 smooth_shading=True,
                 ambient=0.8,
@@ -5215,27 +5304,12 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Remove todas as geometrias provisórias."""
 
-        actor_names = [
-            self._cylinder_region_preview_name,
-            self._cylinder_preview_name,
-            self._cylinder_axis_preview_name,
-            self._cylinder_center_preview_name,
-            *self._cylinder_pattern_preview_names,
-        ]
-
-        for actor_name in actor_names:
-            try:
-                self.viewer.remove_actor(
-                    actor_name,
-                    render=False,
-                )
-            except Exception:
-                pass
-
+        self.recognition_session.clear(render=render)
         self._cylinder_pattern_preview_names = []
-
-        if render:
-            self.viewer.render()
+        self._active_cylinder_region_preview_name = None
+        self._active_cylinder_preview_name = None
+        self._active_cylinder_axis_preview_name = None
+        self._active_cylinder_center_preview_name = None
 
     def open_stl(self) -> None:
         """Importa um STL pelo histórico."""
@@ -5267,6 +5341,8 @@ class MainWindow(QMainWindow):
 
             object_id = self._next_mesh_id()
             file_name = Path(file_path).name
+
+            self.recognition_session.clear()
 
             render_options = {
                 "color": "#8796a8",
